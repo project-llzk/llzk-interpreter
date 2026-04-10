@@ -33,6 +33,11 @@ impl Felt {
         Self::new(BigUint::from(value))
     }
 
+    /// Returns the additive identity (zero).
+    pub fn zero() -> Self {
+        Self::from_u64(0)
+    }
+
     /// Constructs a field element from decimal digits.
     pub fn from_decimal(value: &str) -> Result<Self, String> {
         let bigint = BigUint::parse_bytes(value.as_bytes(), 10)

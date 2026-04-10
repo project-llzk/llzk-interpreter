@@ -18,6 +18,8 @@ Implemented runtime support includes:
 - `cast.toindex`
 - `array.new`, `array.read`, `array.write`
 - `scf.if`, `scf.yield`
+- `llzk.nondet` (resolved from a pre-supplied FIFO queue via
+  `Interpreter::set_nondet_values`, falls back to zero when empty)
 
 ## CLI
 

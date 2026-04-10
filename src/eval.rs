@@ -8,6 +8,8 @@ use llzk::{
     },
 };
 
+use std::collections::VecDeque;
+
 use crate::{
     Error, Result,
     dispatch::{
@@ -15,13 +17,14 @@ use crate::{
         operands, parse_cmp_predicate, parse_felt_const, parse_usize_const, result_struct_name,
     },
     state::{ExecutionState, Frame},
-    value::{ArrayInstance, StructInstance, Value},
+    value::{ArrayInstance, Felt, StructInstance, Value},
 };
 
 /// Concrete interpreter for a small LLZK subset.
 pub struct Interpreter<'c, 'm> {
     module: &'m Module<'c>,
     state: ExecutionState,
+    nondet_queue: VecDeque<Felt>,
 }
 
 impl<'c, 'm> Interpreter<'c, 'm> {
@@ -30,12 +33,17 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         Self {
             module,
             state: ExecutionState::default(),
+            nondet_queue: VecDeque::new(),
         }
     }
 
     /// Returns the collected constraint checks.
     pub fn state(&self) -> &ExecutionState {
         &self.state
+    }
+
+    pub fn set_nondet_values(&mut self, values: impl IntoIterator<Item = Felt>) {
+        self.nondet_queue = values.into_iter().collect();
     }
 
     /// Executes `@Struct::@compute` and returns the resulting struct instance.
@@ -162,6 +170,16 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             let attr = op.attribute("value").map_err(Error::from)?;
             let value = Value::Index(parse_usize_const(attr)?);
             frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+            return Ok(());
+        }
+
+        if dialect::llzk::is_nondet(op) {
+            // Pull from the pre-supplied queue, falling back to zero.
+            let value = self.nondet_queue.pop_front().unwrap_or_else(Felt::zero);
+            frame.insert(
+                op.result(0).map_err(Error::from)?.into(),
+                Value::Felt(value),
+            );
             return Ok(());
         }
 

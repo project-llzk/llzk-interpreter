@@ -535,3 +535,87 @@ module attributes {llzk.lang} {
     assert_eq!(equal, vec![Value::Bool(true)]);
     assert_eq!(different, vec![Value::Bool(false)]);
 }
+
+#[test]
+fn nondet_consumes_pre_supplied_values_in_order() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @sum_two_nondet() -> !felt.type<"bn254"> {
+    %a = llzk.nondet : !felt.type<"bn254">
+    %b = llzk.nondet : !felt.type<"bn254">
+    %r = felt.add %a, %b : !felt.type<"bn254">, !felt.type<"bn254">
+    function.return %r : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    interpreter.set_nondet_values([Felt::from_u64(7), Felt::from_u64(11)]);
+    let result = interpreter
+        .run_function("@sum_two_nondet", &[])
+        .expect("function should run");
+
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(18))]);
+}
+
+#[test]
+fn nondet_falls_back_to_zero_when_queue_is_empty() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @nondet_then_add_one() -> !felt.type<"bn254"> {
+    %x = llzk.nondet : !felt.type<"bn254">
+    %one = felt.const 1 <"bn254">
+    %r = felt.add %x, %one : !felt.type<"bn254">, !felt.type<"bn254">
+    function.return %r : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    // No values supplied — nondet should default to zero.
+    let result = interpreter
+        .run_function("@nondet_then_add_one", &[])
+        .expect("function should run");
+
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(1))]);
+}
+
+#[test]
+fn nondet_partial_queue_drains_then_falls_back_to_zero() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @three_nondet() -> !felt.type<"bn254"> {
+    %a = llzk.nondet : !felt.type<"bn254">
+    %b = llzk.nondet : !felt.type<"bn254">
+    %c = llzk.nondet : !felt.type<"bn254">
+    %s1 = felt.add %a, %b : !felt.type<"bn254">, !felt.type<"bn254">
+    %s2 = felt.add %s1, %c : !felt.type<"bn254">, !felt.type<"bn254">
+    function.return %s2 : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    // Only two values for three nondet ops; the third should default to zero.
+    interpreter.set_nondet_values([Felt::from_u64(5), Felt::from_u64(8)]);
+    let result = interpreter
+        .run_function("@three_nondet", &[])
+        .expect("function should run");
+
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(13))]);
+}
