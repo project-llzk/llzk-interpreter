@@ -101,8 +101,7 @@ pub fn parse_cmp_predicate<'c>(attr: Attribute<'c>) -> Result<&'static str> {
     let text = attr.to_string();
     let pred = text
         .split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|chunk| !chunk.is_empty())
-        .next_back()
+        .rfind(|chunk| !chunk.is_empty())
         .ok_or_else(|| Error::ParseError(format!("invalid bool.cmp predicate: {text}")))?;
     Ok(match pred {
         "eq" => "eq",
