@@ -8,8 +8,8 @@ Yes, this interpreter was vibecoded.
 
 Implemented runtime support includes:
 
-- `felt`: `const`, `add`, `sub`, `mul`, `div`, `neg`, `bit_and`, `bit_or`,
-  `bit_xor`, `shl`, `shr`, `pow`
+- `felt`: `const`, `add`, `sub`, `mul`, `div`, `uintdiv`, `umod`, `neg`,
+  `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`, `pow`
 - `bool`: `cmp`, `and`, `or`, `not`, `assert`
 - `constrain.eq`
 - `function.call`, `function.return`
@@ -17,6 +17,7 @@ Implemented runtime support includes:
 - `arith.constant` for index values
 - `cast.toindex`
 - `array.new`, `array.read`, `array.write`
+- `ram.load`, `ram.store` (flat felt memory; unwritten cells read as zero)
 - `scf.if`, `scf.yield`
 - `llzk.nondet` (resolved from a pre-supplied FIFO queue via
   `Interpreter::set_nondet_values`, falls back to zero when empty)

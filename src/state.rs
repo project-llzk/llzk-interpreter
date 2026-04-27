@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use llzk::prelude::{Value as MlirValue, ValueLike};
 
-use crate::value::Value;
+use crate::value::{Felt, Value};
 
 /// A concrete equality check observed during `constrain`.
 #[derive(Clone, Debug)]
@@ -40,6 +40,9 @@ pub struct ExecutionState {
     pub call_stack: Vec<String>,
     /// Concrete constraints checked so far.
     pub constraints: Vec<ConstraintRecord>,
+    /// Flat felt memory region addressed by `ram.load` / `ram.store`.
+    /// Unwritten cells read as zero.
+    ram: HashMap<usize, Felt>,
 }
 
 impl ExecutionState {
@@ -51,6 +54,14 @@ impl ExecutionState {
             rhs,
             satisfied,
         });
+    }
+
+    pub fn ram_store(&mut self, addr: usize, value: Felt) {
+        self.ram.insert(addr, value);
+    }
+
+    pub fn ram_load(&self, addr: usize) -> Felt {
+        self.ram.get(&addr).cloned().unwrap_or_else(Felt::zero)
     }
 }
 

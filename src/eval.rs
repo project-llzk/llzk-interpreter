@@ -348,6 +348,8 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             || dialect::felt::is_felt_sub(op)
             || dialect::felt::is_felt_mul(op)
             || dialect::felt::is_felt_div(op)
+            || dialect::felt::is_felt_uintdiv(op)
+            || dialect::felt::is_felt_umod(op)
         {
             let ops = operands(op)?;
             let lhs = frame
@@ -368,8 +370,12 @@ impl<'c, 'm> Interpreter<'c, 'm> {
                 lhs - rhs
             } else if dialect::felt::is_felt_mul(op) {
                 lhs * rhs
-            } else {
+            } else if dialect::felt::is_felt_div(op) {
                 lhs / rhs
+            } else if dialect::felt::is_felt_uintdiv(op) {
+                Felt::new(lhs.as_biguint() / rhs.as_biguint())
+            } else {
+                Felt::new(lhs.as_biguint() % rhs.as_biguint())
             };
             frame.insert(
                 op.result(0).map_err(Error::from)?.into(),
@@ -614,6 +620,40 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             for (index, value) in results.into_iter().enumerate() {
                 frame.insert(op.result(index).map_err(Error::from)?.into(), value);
             }
+            return Ok(());
+        }
+
+        if dialect::ram::is_ram_store(op) {
+            let ops = operands(op)?;
+            let addr = frame
+                .get(ops[0])
+                .cloned()
+                .ok_or_else(|| Error::MissingValue("missing ram.store address".into()))?
+                .as_index()
+                .map_err(Error::TypeError)?;
+            let value = frame
+                .get(ops[1])
+                .cloned()
+                .ok_or_else(|| Error::MissingValue("missing ram.store value".into()))?
+                .as_felt()
+                .map_err(Error::TypeError)?;
+            self.state.ram_store(addr, value);
+            return Ok(());
+        }
+
+        if dialect::ram::is_ram_load(op) {
+            let ops = operands(op)?;
+            let addr = frame
+                .get(ops[0])
+                .cloned()
+                .ok_or_else(|| Error::MissingValue("missing ram.load address".into()))?
+                .as_index()
+                .map_err(Error::TypeError)?;
+            let value = self.state.ram_load(addr);
+            frame.insert(
+                op.result(0).map_err(Error::from)?.into(),
+                Value::Felt(value),
+            );
             return Ok(());
         }
 
