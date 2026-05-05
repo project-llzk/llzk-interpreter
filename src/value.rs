@@ -153,15 +153,100 @@ impl Neg for Felt {
     }
 }
 
+/// Fixed-width two's-complement integer value.
+///
+/// `value` is the canonical unsigned representation in `[0, 2^width)`.
+/// Operations interpret bits as signed or unsigned per the operation's
+/// semantics (e.g. `arith.divsi` vs `arith.divui`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntValue {
+    value: BigUint,
+    width: u32,
+}
+
+impl IntValue {
+    /// Creates an integer value, masking to the given bit width.
+    pub fn new(value: BigUint, width: u32) -> Self {
+        if width == 0 {
+            return Self {
+                value: BigUint::zero(),
+                width,
+            };
+        }
+        let modulus = BigUint::one() << width;
+        Self {
+            value: value % modulus,
+            width,
+        }
+    }
+
+    /// Creates an integer value from a (possibly negative) signed integer,
+    /// reducing to the canonical unsigned representation.
+    pub fn from_signed(value: BigInt, width: u32) -> Self {
+        if width == 0 {
+            return Self {
+                value: BigUint::zero(),
+                width,
+            };
+        }
+        let modulus = BigInt::from_biguint(Sign::Plus, BigUint::one() << width);
+        let normalized = ((value % &modulus) + &modulus) % &modulus;
+        Self {
+            value: normalized
+                .to_biguint()
+                .expect("normalized integer is non-negative"),
+            width,
+        }
+    }
+
+    /// Creates an integer value from a small signed integer.
+    pub fn from_i64(value: i64, width: u32) -> Self {
+        Self::from_signed(BigInt::from(value), width)
+    }
+
+    /// Bit width.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Canonical unsigned representation.
+    pub fn as_unsigned(&self) -> &BigUint {
+        &self.value
+    }
+
+    /// Two's-complement signed interpretation.
+    pub fn as_signed(&self) -> BigInt {
+        if self.width == 0 {
+            return BigInt::zero();
+        }
+        let half = BigUint::one() << (self.width - 1);
+        if self.value >= half {
+            let modulus = BigUint::one() << self.width;
+            BigInt::from_biguint(Sign::Plus, self.value.clone())
+                - BigInt::from_biguint(Sign::Plus, modulus)
+        } else {
+            BigInt::from_biguint(Sign::Plus, self.value.clone())
+        }
+    }
+}
+
+impl fmt::Display for IntValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "i{}({})", self.width, self.value)
+    }
+}
+
 /// Concrete runtime values supported by the toy interpreter.
 #[derive(Clone, Debug)]
 pub enum Value {
     /// A field element.
     Felt(Felt),
-    /// A boolean.
+    /// A boolean (i1) value.
     Bool(bool),
-    /// An index value.
+    /// An `index`-typed value.
     Index(usize),
+    /// A fixed-width integer (`iN` for N >= 2).
+    Int(IntValue),
     /// A mutable array instance.
     Array(ArrayRef),
     /// A mutable struct instance.
@@ -246,6 +331,14 @@ impl Value {
         }
     }
 
+    /// Returns the inner fixed-width integer or an explanatory error string.
+    pub fn as_int(&self) -> Result<IntValue, String> {
+        match self {
+            Self::Int(value) => Ok(value.clone()),
+            other => Err(format!("expected int, got {other}")),
+        }
+    }
+
     /// Returns the inner array reference or an explanatory error string.
     pub fn as_array(&self) -> Result<ArrayRef, String> {
         match self {
@@ -277,6 +370,7 @@ impl PartialEq for Value {
             (Self::Felt(lhs), Self::Felt(rhs)) => lhs == rhs,
             (Self::Bool(lhs), Self::Bool(rhs)) => lhs == rhs,
             (Self::Index(lhs), Self::Index(rhs)) => lhs == rhs,
+            (Self::Int(lhs), Self::Int(rhs)) => lhs == rhs,
             (Self::Array(lhs), Self::Array(rhs)) => *lhs.borrow() == *rhs.borrow(),
             (Self::Struct(lhs), Self::Struct(rhs)) => *lhs.borrow() == *rhs.borrow(),
             _ => false,
@@ -298,6 +392,7 @@ impl fmt::Display for Value {
             Self::Felt(value) => write!(f, "felt({value})"),
             Self::Bool(value) => write!(f, "bool({value})"),
             Self::Index(value) => write!(f, "index({value})"),
+            Self::Int(value) => write!(f, "int({value})"),
             Self::Array(value) => write!(f, "array({:?})", value.borrow().elements),
             Self::Struct(value) => write!(f, "struct({})", value.borrow()),
         }

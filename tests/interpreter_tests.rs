@@ -714,3 +714,487 @@ module attributes {llzk.lang} {
 
     assert_eq!(result, vec![Value::Felt(Felt::from_u64(8))]);
 }
+
+fn run_int_function(ir: &str, name: &str, args: &[Value]) -> Vec<Value> {
+    let context = LlzkContext::new();
+    let module = Module::parse(&context, ir).unwrap_or_else(|| {
+        panic!("module should parse:\n----\n{}\n----", ir);
+    });
+    let mut interpreter = Interpreter::new(&module);
+    interpreter
+        .run_function(name, args)
+        .expect("function should run")
+}
+
+#[test]
+fn arith_index_basic_arithmetic() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @idx() -> index {
+    %a = arith.constant 10 : index
+    %b = arith.constant 3 : index
+    %s = arith.addi %a, %b : index
+    %m = arith.muli %s, %b : index
+    %d = arith.subi %m, %a : index
+    function.return %d : index
+  }
+}
+"#,
+        "@idx",
+        &[],
+    );
+    // (10 + 3) * 3 - 10 = 39 - 10 = 29
+    assert_eq!(result, vec![Value::Index(29)]);
+}
+
+#[test]
+fn arith_index_division_and_remainder() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @divs() -> (index, index, index, index) {
+    %a = arith.constant 17 : index
+    %b = arith.constant 5 : index
+    %dv = arith.divui %a, %b : index
+    %rm = arith.remui %a, %b : index
+    %ce = arith.ceildivui %a, %b : index
+    %fl = arith.floordivsi %a, %b : index
+    function.return %dv, %rm, %ce, %fl : index, index, index, index
+  }
+}
+"#,
+        "@divs",
+        &[],
+    );
+    assert_eq!(
+        result,
+        vec![
+            Value::Index(3), // 17 / 5
+            Value::Index(2), // 17 % 5
+            Value::Index(4), // ceil(17/5)
+            Value::Index(3), // floor(17/5)
+        ]
+    );
+}
+
+#[test]
+fn arith_index_bitwise_and_shifts() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @bits() -> (index, index, index, index, index) {
+    %a = arith.constant 12 : index
+    %b = arith.constant 10 : index
+    %two = arith.constant 2 : index
+    %and = arith.andi %a, %b : index
+    %or  = arith.ori  %a, %b : index
+    %xor = arith.xori %a, %b : index
+    %shl = arith.shli %a, %two : index
+    %shr = arith.shrui %a, %two : index
+    function.return %and, %or, %xor, %shl, %shr : index, index, index, index, index
+  }
+}
+"#,
+        "@bits",
+        &[],
+    );
+    assert_eq!(
+        result,
+        vec![
+            Value::Index(8),  // 12 & 10
+            Value::Index(14), // 12 | 10
+            Value::Index(6),  // 12 ^ 10
+            Value::Index(48), // 12 << 2
+            Value::Index(3),  // 12 >> 2
+        ]
+    );
+}
+
+#[test]
+fn arith_index_min_max() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @mm() -> (index, index) {
+    %a = arith.constant 7 : index
+    %b = arith.constant 3 : index
+    %mx = arith.maxui %a, %b : index
+    %mn = arith.minui %a, %b : index
+    function.return %mx, %mn : index, index
+  }
+}
+"#,
+        "@mm",
+        &[],
+    );
+    assert_eq!(result, vec![Value::Index(7), Value::Index(3)]);
+}
+
+#[test]
+fn arith_select_picks_branch_by_condition() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @sel(%c: i1) -> index {
+    %a = arith.constant 100 : index
+    %b = arith.constant 200 : index
+    %r = arith.select %c, %a, %b : index
+    function.return %r : index
+  }
+}
+"#,
+        "@sel",
+        &[Value::Bool(true)],
+    );
+    assert_eq!(result, vec![Value::Index(100)]);
+
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @sel(%c: i1) -> index {
+    %a = arith.constant 100 : index
+    %b = arith.constant 200 : index
+    %r = arith.select %c, %a, %b : index
+    function.return %r : index
+  }
+}
+"#,
+        "@sel",
+        &[Value::Bool(false)],
+    );
+    assert_eq!(result, vec![Value::Index(200)]);
+}
+
+#[test]
+fn arith_cmpi_unsigned_on_index() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @cmps() -> (i1, i1, i1, i1, i1) {
+    %a = arith.constant 5 : index
+    %b = arith.constant 10 : index
+    %eq = arith.cmpi eq, %a, %b : index
+    %ne = arith.cmpi ne, %a, %b : index
+    %lt = arith.cmpi ult, %a, %b : index
+    %le = arith.cmpi ule, %a, %a : index
+    %gt = arith.cmpi ugt, %b, %a : index
+    function.return %eq, %ne, %lt, %le, %gt : i1, i1, i1, i1, i1
+  }
+}
+"#,
+        "@cmps",
+        &[],
+    );
+    assert_eq!(
+        result,
+        vec![
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]
+    );
+}
+
+#[test]
+fn arith_constant_negative_i32_internal() {
+    // Wider integers are not allowed at function boundaries, so we must
+    // observe them indirectly. Here we form -1 : i32 and compare with itself.
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @neg() -> i1 {
+    %x = arith.constant -1 : i32
+    %y = arith.constant 4294967295 : i32
+    %eq = arith.cmpi eq, %x, %y : i32
+    function.return %eq : i1
+  }
+}
+"#,
+        "@neg",
+        &[],
+    );
+    // -1 (i32) and 4294967295 (i32) share the same bit pattern.
+    assert_eq!(result, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn arith_signed_vs_unsigned_compare_on_i32() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @sv() -> (i1, i1) {
+    %a = arith.constant -1 : i32
+    %b = arith.constant 1 : i32
+    %slt = arith.cmpi slt, %a, %b : i32
+    %ult = arith.cmpi ult, %a, %b : i32
+    function.return %slt, %ult : i1, i1
+  }
+}
+"#,
+        "@sv",
+        &[],
+    );
+    // -1 < 1 signed = true, but 0xFFFFFFFF < 1 unsigned = false.
+    assert_eq!(result, vec![Value::Bool(true), Value::Bool(false)]);
+}
+
+#[test]
+fn arith_addi_overflow_wraps_i8() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @wrap() -> i1 {
+    %a = arith.constant 127 : i8
+    %one = arith.constant 1 : i8
+    %sum = arith.addi %a, %one : i8
+    %expected = arith.constant -128 : i8
+    %eq = arith.cmpi eq, %sum, %expected : i8
+    function.return %eq : i1
+  }
+}
+"#,
+        "@wrap",
+        &[],
+    );
+    // 127 + 1 in i8 wraps to -128.
+    assert_eq!(result, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn arith_signed_division_truncates_toward_zero() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @divs() -> (i1, i1, i1) {
+    %neg7 = arith.constant -7 : i32
+    %two = arith.constant 2 : i32
+    %ds = arith.divsi %neg7, %two : i32
+    %rs = arith.remsi %neg7, %two : i32
+    %fl = arith.floordivsi %neg7, %two : i32
+
+    %m3 = arith.constant -3 : i32
+    %m1 = arith.constant -1 : i32
+    %m4 = arith.constant -4 : i32
+    %eq_ds = arith.cmpi eq, %ds, %m3 : i32
+    %eq_rs = arith.cmpi eq, %rs, %m1 : i32
+    %eq_fl = arith.cmpi eq, %fl, %m4 : i32
+    function.return %eq_ds, %eq_rs, %eq_fl : i1, i1, i1
+  }
+}
+"#,
+        "@divs",
+        &[],
+    );
+    // divsi(-7,2) = -3 (truncation toward zero)
+    // remsi(-7,2) = -1 (sign of dividend)
+    // floordivsi(-7,2) = -4 (round toward -inf)
+    assert_eq!(
+        result,
+        vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)]
+    );
+}
+
+#[test]
+fn arith_unsigned_division_treats_negative_as_large() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @divu() -> i1 {
+    %neg1 = arith.constant -1 : i32
+    %two = arith.constant 2 : i32
+    %du = arith.divui %neg1, %two : i32
+    // (2^32 - 1) / 2 = 2^31 - 1 = 2147483647
+    %expected = arith.constant 2147483647 : i32
+    %eq = arith.cmpi eq, %du, %expected : i32
+    function.return %eq : i1
+  }
+}
+"#,
+        "@divu",
+        &[],
+    );
+    assert_eq!(result, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn arith_arithmetic_shift_right_preserves_sign() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @shr() -> (i1, i1) {
+    %neg8 = arith.constant -8 : i32
+    %two = arith.constant 2 : i32
+    %srs = arith.shrsi %neg8, %two : i32
+    %sru = arith.shrui %neg8, %two : i32
+    %expected_s = arith.constant -2 : i32
+    %expected_u = arith.constant 1073741822 : i32
+    %eq_s = arith.cmpi eq, %srs, %expected_s : i32
+    %eq_u = arith.cmpi eq, %sru, %expected_u : i32
+    function.return %eq_s, %eq_u : i1, i1
+  }
+}
+"#,
+        "@shr",
+        &[],
+    );
+    // -8 >>s 2 = -2 (arithmetic), -8 >>u 2 = 0xFFFFFFF8 >> 2 = 0x3FFFFFFE
+    assert_eq!(result, vec![Value::Bool(true), Value::Bool(true)]);
+}
+
+#[test]
+fn arith_extsi_extends_sign_bit() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @ext() -> (i1, i1) {
+    %narrow = arith.constant -1 : i8
+    %s = arith.extsi %narrow : i8 to i32
+    %u = arith.extui %narrow : i8 to i32
+    %neg1_32 = arith.constant -1 : i32
+    %ff = arith.constant 255 : i32
+    %eq_s = arith.cmpi eq, %s, %neg1_32 : i32
+    %eq_u = arith.cmpi eq, %u, %ff : i32
+    function.return %eq_s, %eq_u : i1, i1
+  }
+}
+"#,
+        "@ext",
+        &[],
+    );
+    // extsi(-1:i8) -> -1:i32 ; extui(-1:i8) -> 0x000000FF
+    assert_eq!(result, vec![Value::Bool(true), Value::Bool(true)]);
+}
+
+#[test]
+fn arith_trunci_keeps_low_bits() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @tr() -> i1 {
+    %wide = arith.constant 74565 : i32
+    %narrow = arith.trunci %wide : i32 to i8
+    %expected = arith.constant 69 : i8
+    %eq = arith.cmpi eq, %narrow, %expected : i8
+    function.return %eq : i1
+  }
+}
+"#,
+        "@tr",
+        &[],
+    );
+    // 74565 = 0x12345; truncated to i8 = 0x45 = 69
+    assert_eq!(result, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn arith_index_cast_to_and_from_i32() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @rt(%i: index) -> index {
+    %as_i32 = arith.index_cast %i : index to i32
+    %back = arith.index_cast %as_i32 : i32 to index
+    function.return %back : index
+  }
+}
+"#,
+        "@rt",
+        &[Value::Index(123)],
+    );
+    assert_eq!(result, vec![Value::Index(123)]);
+}
+
+#[test]
+fn arith_signed_min_max_internal() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @mm() -> (i1, i1) {
+    %neg = arith.constant -1 : i32
+    %pos = arith.constant 1 : i32
+    %xs = arith.maxsi %neg, %pos : i32
+    %ns = arith.minsi %neg, %pos : i32
+    %eq_xs = arith.cmpi eq, %xs, %pos : i32
+    %eq_ns = arith.cmpi eq, %ns, %neg : i32
+    function.return %eq_xs, %eq_ns : i1, i1
+  }
+}
+"#,
+        "@mm",
+        &[],
+    );
+    assert_eq!(result, vec![Value::Bool(true), Value::Bool(true)]);
+}
+
+#[test]
+fn arith_select_with_int_internal_branches() {
+    let result = run_int_function(
+        r#"
+module attributes {llzk.lang} {
+  function.def @sel(%c: i1) -> i1 {
+    %a = arith.constant 10 : i32
+    %b = arith.constant 20 : i32
+    %r = arith.select %c, %a, %b : i32
+    %expected = arith.constant 10 : i32
+    %eq = arith.cmpi eq, %r, %expected : i32
+    function.return %eq : i1
+  }
+}
+"#,
+        "@sel",
+        &[Value::Bool(true)],
+    );
+    assert_eq!(result, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn arith_divsi_by_zero_fails() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @bad() -> index {
+    %a = arith.constant 5 : i32
+    %z = arith.constant 0 : i32
+    %r = arith.divsi %a, %z : i32
+    %idx = arith.constant 0 : index
+    function.return %idx : index
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+    let mut interpreter = Interpreter::new(&module);
+    let err = interpreter
+        .run_function("@bad", &[])
+        .expect_err("division by zero should fail");
+    assert!(err.to_string().contains("by zero"));
+}
+
+#[test]
+fn arith_remui_by_zero_on_index_fails() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @bad() -> index {
+    %a = arith.constant 5 : index
+    %z = arith.constant 0 : index
+    %r = arith.remui %a, %z : index
+    function.return %r : index
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+    let mut interpreter = Interpreter::new(&module);
+    let err = interpreter
+        .run_function("@bad", &[])
+        .expect_err("remainder by zero should fail");
+    assert!(err.to_string().contains("by zero"));
+}

@@ -7,7 +7,7 @@ mod value;
 
 pub use eval::Interpreter;
 pub use state::{ConstraintRecord, ExecutionState};
-pub use value::{ArrayInstance, Felt, StructInstance, Value};
+pub use value::{ArrayInstance, Felt, IntValue, StructInstance, Value};
 
 /// Interpreter error.
 #[derive(Debug)]

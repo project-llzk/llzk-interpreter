@@ -14,7 +14,16 @@ Implemented runtime support includes:
 - `constrain.eq`
 - `function.call`, `function.return`
 - `struct.new`, `struct.readm`, `struct.writem`
-- `arith.constant` for index values
+- `arith`:
+  - `constant` (for `index`, `i1`, and arbitrary-width `iN`)
+  - arithmetic: `addi`, `subi`, `muli`, `divsi`, `divui`, `remsi`, `remui`,
+    `ceildivsi`, `ceildivui`, `floordivsi`
+  - bitwise/shift: `andi`, `ori`, `xori`, `shli`, `shrsi`, `shrui`
+  - min/max: `maxsi`, `maxui`, `minsi`, `minui`
+  - comparison: `cmpi` (all 10 predicates: `eq`, `ne`, `slt`, `sle`, `sgt`,
+    `sge`, `ult`, `ule`, `ugt`, `uge`)
+  - casts: `extsi`, `extui`, `trunci`, `index_cast`, `index_castui`
+  - `select`
 - `cast.toindex`, `cast.tofelt`
 - `array.new`, `array.read`, `array.write`
 - `ram.load`, `ram.store` (flat felt memory; unwritten cells read as zero)

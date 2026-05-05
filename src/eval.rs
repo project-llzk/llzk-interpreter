@@ -3,21 +3,24 @@ use std::{cell::RefCell, rc::Rc};
 use llzk::{
     dialect,
     prelude::{
-        BlockLike, FuncDefOpLike, FuncDefOpRef, Module, OperationLike, OperationRef, RegionLike,
-        StructDefOpLike,
+        BlockLike, FuncDefOpLike, FuncDefOpRef, IntegerType, Module, OperationLike, OperationRef,
+        RegionLike, StructDefOpLike, TypeLike, ValueLike,
     },
 };
+use num_bigint::{BigInt, BigUint};
+use num_traits::{One, Zero};
 
 use std::collections::VecDeque;
 
 use crate::{
     Error, Result,
     dispatch::{
-        call_target, find_function, find_struct, fq_function_name, iter_block_ops, member_name,
-        operands, parse_cmp_predicate, parse_felt_const, parse_usize_const, result_struct_name,
+        CmpIPredicate, call_target, find_function, find_struct, fq_function_name, iter_block_ops,
+        member_name, operands, parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate,
+        parse_felt_const, result_struct_name,
     },
     state::{ExecutionState, Frame},
-    value::{ArrayInstance, Felt, StructInstance, Value},
+    value::{ArrayInstance, Felt, IntValue, StructInstance, Value},
 };
 
 /// Concrete interpreter for a small LLZK subset.
@@ -263,12 +266,256 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         }
     }
 
+    fn eval_arith_op(
+        &mut self,
+        suffix: &str,
+        op: &OperationRef<'c, '_>,
+        frame: &mut Frame,
+    ) -> Result<()> {
+        match suffix {
+            "constant" => {
+                let attr = op.attribute("value").map_err(Error::from)?;
+                let result_ty = op.result(0).map_err(Error::from)?.r#type();
+                let value = parse_arith_const_value(attr, result_ty)?;
+                frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+                Ok(())
+            }
+            "addi" | "subi" | "muli" | "divsi" | "divui" | "remsi" | "remui" | "ceildivsi"
+            | "ceildivui" | "floordivsi" | "andi" | "ori" | "xori" | "shli" | "shrsi" | "shrui"
+            | "maxsi" | "maxui" | "minsi" | "minui" => self.eval_arith_binary(suffix, op, frame),
+            "cmpi" => self.eval_arith_cmpi(op, frame),
+            "select" => self.eval_arith_select(op, frame),
+            "extsi" | "extui" | "trunci" | "index_cast" | "index_castui" => {
+                self.eval_arith_cast(suffix, op, frame)
+            }
+            other => Err(Error::UnsupportedOp(format!("arith.{other}"))),
+        }
+    }
+
+    fn eval_arith_binary(
+        &mut self,
+        suffix: &str,
+        op: &OperationRef<'c, '_>,
+        frame: &mut Frame,
+    ) -> Result<()> {
+        let ops = operands(op)?;
+        let lhs = frame
+            .get(ops[0])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue(format!("missing arith.{suffix} lhs")))?;
+        let rhs = frame
+            .get(ops[1])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue(format!("missing arith.{suffix} rhs")))?;
+
+        let value = match (&lhs, &rhs) {
+            (Value::Index(a), Value::Index(b)) => {
+                let result = arith_binary_index(suffix, *a, *b)?;
+                Value::Index(result)
+            }
+            (Value::Int(a), Value::Int(b)) => {
+                if a.width() != b.width() {
+                    return Err(Error::TypeError(format!(
+                        "arith.{suffix} operand width mismatch: i{} vs i{}",
+                        a.width(),
+                        b.width()
+                    )));
+                }
+                Value::Int(arith_binary_int(suffix, a, b)?)
+            }
+            (Value::Bool(a), Value::Bool(b)) => match suffix {
+                "andi" => Value::Bool(*a && *b),
+                "ori" => Value::Bool(*a || *b),
+                "xori" => Value::Bool(*a ^ *b),
+                _ => {
+                    return Err(Error::TypeError(format!(
+                        "arith.{suffix} not supported on i1 operands"
+                    )));
+                }
+            },
+            _ => {
+                return Err(Error::TypeError(format!(
+                    "arith.{suffix} requires matching integer operands, got {lhs} and {rhs}"
+                )));
+            }
+        };
+        frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+        Ok(())
+    }
+
+    fn eval_arith_cmpi(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
+        let predicate = parse_cmpi_predicate(op.attribute("predicate").map_err(Error::from)?)?;
+        let ops = operands(op)?;
+        let lhs = frame
+            .get(ops[0])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue("missing arith.cmpi lhs".into()))?;
+        let rhs = frame
+            .get(ops[1])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue("missing arith.cmpi rhs".into()))?;
+
+        let result = match (&lhs, &rhs) {
+            (Value::Index(a), Value::Index(b)) => cmpi_unsigned(predicate, &BigInt::from(*a), &BigInt::from(*b), &BigUint::from(*a), &BigUint::from(*b)),
+            (Value::Int(a), Value::Int(b)) => {
+                if a.width() != b.width() {
+                    return Err(Error::TypeError(format!(
+                        "arith.cmpi operand width mismatch: i{} vs i{}",
+                        a.width(),
+                        b.width()
+                    )));
+                }
+                cmpi_unsigned(predicate, &a.as_signed(), &b.as_signed(), a.as_unsigned(), b.as_unsigned())
+            }
+            (Value::Bool(a), Value::Bool(b)) => {
+                // i1 signed interpretation: 1 -> -1, 0 -> 0.
+                let av = if *a { BigInt::from(-1i64) } else { BigInt::from(0) };
+                let bv = if *b { BigInt::from(-1i64) } else { BigInt::from(0) };
+                let au = BigUint::from(*a as u64);
+                let bu = BigUint::from(*b as u64);
+                cmpi_unsigned(predicate, &av, &bv, &au, &bu)
+            }
+            _ => {
+                return Err(Error::TypeError(format!(
+                    "arith.cmpi requires matching integer operands, got {lhs} and {rhs}"
+                )));
+            }
+        };
+        frame.insert(
+            op.result(0).map_err(Error::from)?.into(),
+            Value::Bool(result),
+        );
+        Ok(())
+    }
+
+    fn eval_arith_select(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
+        let ops = operands(op)?;
+        let cond = frame
+            .get(ops[0])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue("missing arith.select condition".into()))?
+            .as_bool()
+            .map_err(Error::TypeError)?;
+        let true_val = frame
+            .get(ops[1])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue("missing arith.select true value".into()))?;
+        let false_val = frame
+            .get(ops[2])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue("missing arith.select false value".into()))?;
+        frame.insert(
+            op.result(0).map_err(Error::from)?.into(),
+            if cond { true_val } else { false_val },
+        );
+        Ok(())
+    }
+
+    fn eval_arith_cast(
+        &mut self,
+        suffix: &str,
+        op: &OperationRef<'c, '_>,
+        frame: &mut Frame,
+    ) -> Result<()> {
+        let ops = operands(op)?;
+        let operand = frame
+            .get(ops[0])
+            .cloned()
+            .ok_or_else(|| Error::MissingValue(format!("missing arith.{suffix} operand")))?;
+        let result_ty = op.result(0).map_err(Error::from)?.r#type();
+
+        let value = match suffix {
+            "extsi" => {
+                let signed = value_as_signed(&operand)?;
+                let int_ty = IntegerType::try_from(result_ty)
+                    .map_err(|_| Error::TypeError("arith.extsi result must be integer".into()))?;
+                let width = int_ty.width();
+                if width == 1 {
+                    Value::Bool(!signed.is_zero())
+                } else {
+                    Value::Int(IntValue::from_signed(signed, width))
+                }
+            }
+            "extui" => {
+                let unsigned = value_as_unsigned(&operand)?;
+                let int_ty = IntegerType::try_from(result_ty)
+                    .map_err(|_| Error::TypeError("arith.extui result must be integer".into()))?;
+                let width = int_ty.width();
+                if width == 1 {
+                    Value::Bool(!unsigned.is_zero())
+                } else {
+                    Value::Int(IntValue::new(unsigned, width))
+                }
+            }
+            "trunci" => {
+                let unsigned = value_as_unsigned(&operand)?;
+                let int_ty = IntegerType::try_from(result_ty)
+                    .map_err(|_| Error::TypeError("arith.trunci result must be integer".into()))?;
+                let width = int_ty.width();
+                if width == 1 {
+                    Value::Bool(!(unsigned & BigUint::one()).is_zero())
+                } else {
+                    Value::Int(IntValue::new(unsigned, width))
+                }
+            }
+            "index_cast" => {
+                if result_ty.is_index() {
+                    let signed = value_as_signed(&operand)?;
+                    let unsigned = signed
+                        .to_biguint()
+                        .ok_or_else(|| {
+                            Error::TypeError(
+                                "arith.index_cast cannot convert negative value to index".into(),
+                            )
+                        })?;
+                    let idx: usize = unsigned.try_into().map_err(|_| {
+                        Error::TypeError("arith.index_cast value too large for usize".into())
+                    })?;
+                    Value::Index(idx)
+                } else {
+                    let int_ty = IntegerType::try_from(result_ty).map_err(|_| {
+                        Error::TypeError("arith.index_cast result must be index or int".into())
+                    })?;
+                    let signed = value_as_signed(&operand)?;
+                    let width = int_ty.width();
+                    if width == 1 {
+                        Value::Bool(!signed.is_zero())
+                    } else {
+                        Value::Int(IntValue::from_signed(signed, width))
+                    }
+                }
+            }
+            "index_castui" => {
+                if result_ty.is_index() {
+                    let unsigned = value_as_unsigned(&operand)?;
+                    let idx: usize = unsigned.try_into().map_err(|_| {
+                        Error::TypeError("arith.index_castui value too large for usize".into())
+                    })?;
+                    Value::Index(idx)
+                } else {
+                    let int_ty = IntegerType::try_from(result_ty).map_err(|_| {
+                        Error::TypeError("arith.index_castui result must be index or int".into())
+                    })?;
+                    let unsigned = value_as_unsigned(&operand)?;
+                    let width = int_ty.width();
+                    if width == 1 {
+                        Value::Bool(!unsigned.is_zero())
+                    } else {
+                        Value::Int(IntValue::new(unsigned, width))
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+        Ok(())
+    }
+
     fn eval_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
-        if op.name().as_string_ref().as_str() == Ok("arith.constant") {
-            let attr = op.attribute("value").map_err(Error::from)?;
-            let value = Value::Index(parse_usize_const(attr)?);
-            frame.insert(op.result(0).map_err(Error::from)?.into(), value);
-            return Ok(());
+        if let Ok(name) = op.name().as_string_ref().as_str()
+            && let Some(rest) = name.strip_prefix("arith.")
+        {
+            return self.eval_arith_op(rest, op, frame);
         }
 
         if dialect::llzk::is_nondet(op) {
@@ -789,5 +1036,259 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             .unwrap_or("<unknown-op>")
             .to_string();
         Err(Error::UnsupportedOp(op_name))
+    }
+}
+
+fn value_as_signed(value: &Value) -> Result<BigInt> {
+    match value {
+        Value::Index(v) => Ok(BigInt::from(*v)),
+        Value::Int(v) => Ok(v.as_signed()),
+        // i1 signed interpretation: true is -1, false is 0.
+        Value::Bool(b) => Ok(if *b { BigInt::from(-1i64) } else { BigInt::zero() }),
+        other => Err(Error::TypeError(format!(
+            "expected integer-like value, got {other}"
+        ))),
+    }
+}
+
+fn value_as_unsigned(value: &Value) -> Result<BigUint> {
+    match value {
+        Value::Index(v) => Ok(BigUint::from(*v)),
+        Value::Int(v) => Ok(v.as_unsigned().clone()),
+        Value::Bool(b) => Ok(BigUint::from(*b as u64)),
+        other => Err(Error::TypeError(format!(
+            "expected integer-like value, got {other}"
+        ))),
+    }
+}
+
+fn arith_binary_index(suffix: &str, a: usize, b: usize) -> Result<usize> {
+    let result = match suffix {
+        "addi" => a.wrapping_add(b),
+        "subi" => a.wrapping_sub(b),
+        "muli" => a.wrapping_mul(b),
+        "divsi" | "divui" => {
+            if b == 0 {
+                return Err(Error::ConstraintFailed(format!("arith.{suffix} by zero")));
+            }
+            a / b
+        }
+        "remsi" | "remui" => {
+            if b == 0 {
+                return Err(Error::ConstraintFailed(format!("arith.{suffix} by zero")));
+            }
+            a % b
+        }
+        "ceildivsi" | "ceildivui" => {
+            if b == 0 {
+                return Err(Error::ConstraintFailed(format!("arith.{suffix} by zero")));
+            }
+            a.div_ceil(b)
+        }
+        "floordivsi" => {
+            if b == 0 {
+                return Err(Error::ConstraintFailed("arith.floordivsi by zero".into()));
+            }
+            a / b
+        }
+        "andi" => a & b,
+        "ori" => a | b,
+        "xori" => a ^ b,
+        "shli" => {
+            u32::try_from(b)
+                .ok()
+                .and_then(|amt| a.checked_shl(amt))
+                .unwrap_or(0)
+        }
+        "shrsi" | "shrui" => {
+            u32::try_from(b)
+                .ok()
+                .and_then(|amt| a.checked_shr(amt))
+                .unwrap_or(0)
+        }
+        "maxsi" | "maxui" => a.max(b),
+        "minsi" | "minui" => a.min(b),
+        _ => {
+            return Err(Error::UnsupportedOp(format!("arith.{suffix} on index")));
+        }
+    };
+    Ok(result)
+}
+
+fn arith_binary_int(suffix: &str, a: &IntValue, b: &IntValue) -> Result<IntValue> {
+    let width = a.width();
+    match suffix {
+        "addi" => Ok(IntValue::new(a.as_unsigned() + b.as_unsigned(), width)),
+        "subi" => Ok(IntValue::from_signed(a.as_signed() - b.as_signed(), width)),
+        "muli" => Ok(IntValue::new(a.as_unsigned() * b.as_unsigned(), width)),
+        "divsi" => {
+            let bv = b.as_signed();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.divsi by zero".into()));
+            }
+            // Truncated division (toward zero), per LLVM semantics for sdiv.
+            Ok(IntValue::from_signed(a.as_signed() / bv, width))
+        }
+        "divui" => {
+            let bv = b.as_unsigned();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.divui by zero".into()));
+            }
+            Ok(IntValue::new(a.as_unsigned() / bv, width))
+        }
+        "remsi" => {
+            let bv = b.as_signed();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.remsi by zero".into()));
+            }
+            // Truncated remainder (sign of dividend).
+            Ok(IntValue::from_signed(a.as_signed() % bv, width))
+        }
+        "remui" => {
+            let bv = b.as_unsigned();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.remui by zero".into()));
+            }
+            Ok(IntValue::new(a.as_unsigned() % bv, width))
+        }
+        "ceildivsi" => {
+            let bv = b.as_signed();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.ceildivsi by zero".into()));
+            }
+            let av = a.as_signed();
+            let q = &av / &bv;
+            let r = &av % &bv;
+            // Round toward +inf.
+            let adjusted = if !r.is_zero()
+                && ((av.sign() == num_bigint::Sign::Plus)
+                    == (bv.sign() == num_bigint::Sign::Plus))
+            {
+                q + BigInt::one()
+            } else {
+                q
+            };
+            Ok(IntValue::from_signed(adjusted, width))
+        }
+        "ceildivui" => {
+            let bv = b.as_unsigned();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.ceildivui by zero".into()));
+            }
+            let au = a.as_unsigned();
+            let q = au / bv;
+            let r = au % bv;
+            let adjusted = if r.is_zero() { q } else { q + BigUint::one() };
+            Ok(IntValue::new(adjusted, width))
+        }
+        "floordivsi" => {
+            let bv = b.as_signed();
+            if bv.is_zero() {
+                return Err(Error::ConstraintFailed("arith.floordivsi by zero".into()));
+            }
+            let av = a.as_signed();
+            let q = &av / &bv;
+            let r = &av % &bv;
+            // Round toward -inf.
+            let adjusted = if !r.is_zero()
+                && ((av.sign() == num_bigint::Sign::Minus)
+                    != (bv.sign() == num_bigint::Sign::Minus))
+            {
+                q - BigInt::one()
+            } else {
+                q
+            };
+            Ok(IntValue::from_signed(adjusted, width))
+        }
+        "andi" => Ok(IntValue::new(a.as_unsigned() & b.as_unsigned(), width)),
+        "ori" => Ok(IntValue::new(a.as_unsigned() | b.as_unsigned(), width)),
+        "xori" => Ok(IntValue::new(a.as_unsigned() ^ b.as_unsigned(), width)),
+        "shli" => {
+            let amount: u32 = b
+                .as_unsigned()
+                .try_into()
+                .map_err(|_| Error::MalformedOp("arith.shli amount out of range".into()))?;
+            if amount >= width {
+                Ok(IntValue::new(BigUint::zero(), width))
+            } else {
+                Ok(IntValue::new(a.as_unsigned() << amount, width))
+            }
+        }
+        "shrui" => {
+            let amount: u32 = b
+                .as_unsigned()
+                .try_into()
+                .map_err(|_| Error::MalformedOp("arith.shrui amount out of range".into()))?;
+            if amount >= width {
+                Ok(IntValue::new(BigUint::zero(), width))
+            } else {
+                Ok(IntValue::new(a.as_unsigned() >> amount, width))
+            }
+        }
+        "shrsi" => {
+            let amount: u32 = b
+                .as_unsigned()
+                .try_into()
+                .map_err(|_| Error::MalformedOp("arith.shrsi amount out of range".into()))?;
+            let signed = a.as_signed();
+            if amount >= width {
+                let extended = if signed.sign() == num_bigint::Sign::Minus {
+                    BigInt::from(-1i64)
+                } else {
+                    BigInt::zero()
+                };
+                Ok(IntValue::from_signed(extended, width))
+            } else {
+                // Arithmetic shift right is floor-divide by 2^amount.
+                let divisor = BigInt::one() << amount;
+                let q = floor_div_bigint(&signed, &divisor);
+                Ok(IntValue::from_signed(q, width))
+            }
+        }
+        "maxsi" => Ok(IntValue::from_signed(a.as_signed().max(b.as_signed()), width)),
+        "minsi" => Ok(IntValue::from_signed(a.as_signed().min(b.as_signed()), width)),
+        "maxui" => Ok(IntValue::new(
+            a.as_unsigned().max(b.as_unsigned()).clone(),
+            width,
+        )),
+        "minui" => Ok(IntValue::new(
+            a.as_unsigned().min(b.as_unsigned()).clone(),
+            width,
+        )),
+        _ => Err(Error::UnsupportedOp(format!("arith.{suffix}"))),
+    }
+}
+
+fn cmpi_unsigned(
+    predicate: CmpIPredicate,
+    lhs_signed: &BigInt,
+    rhs_signed: &BigInt,
+    lhs_unsigned: &BigUint,
+    rhs_unsigned: &BigUint,
+) -> bool {
+    match predicate {
+        CmpIPredicate::Eq => lhs_unsigned == rhs_unsigned,
+        CmpIPredicate::Ne => lhs_unsigned != rhs_unsigned,
+        CmpIPredicate::Slt => lhs_signed < rhs_signed,
+        CmpIPredicate::Sle => lhs_signed <= rhs_signed,
+        CmpIPredicate::Sgt => lhs_signed > rhs_signed,
+        CmpIPredicate::Sge => lhs_signed >= rhs_signed,
+        CmpIPredicate::Ult => lhs_unsigned < rhs_unsigned,
+        CmpIPredicate::Ule => lhs_unsigned <= rhs_unsigned,
+        CmpIPredicate::Ugt => lhs_unsigned > rhs_unsigned,
+        CmpIPredicate::Uge => lhs_unsigned >= rhs_unsigned,
+    }
+}
+
+fn floor_div_bigint(dividend: &BigInt, divisor: &BigInt) -> BigInt {
+    let q = dividend / divisor;
+    let r = dividend % divisor;
+    if !r.is_zero()
+        && ((dividend.sign() == num_bigint::Sign::Minus)
+            != (divisor.sign() == num_bigint::Sign::Minus))
+    {
+        q - BigInt::one()
+    } else {
+        q
     }
 }
