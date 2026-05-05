@@ -15,7 +15,7 @@ Implemented runtime support includes:
 - `function.call`, `function.return`
 - `struct.new`, `struct.readm`, `struct.writem`
 - `arith.constant` for index values
-- `cast.toindex`
+- `cast.toindex`, `cast.tofelt`
 - `array.new`, `array.read`, `array.write`
 - `ram.load`, `ram.store` (flat felt memory; unwritten cells read as zero)
 - `scf.if`, `scf.yield`

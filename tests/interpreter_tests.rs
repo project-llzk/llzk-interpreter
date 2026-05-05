@@ -619,3 +619,30 @@ module attributes {llzk.lang} {
 
     assert_eq!(result, vec![Value::Felt(Felt::from_u64(13))]);
 }
+
+#[test]
+fn interprets_cast_tofelt_from_index() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @index_to_felt() -> !felt.type<"bn254"> {
+    %i = arith.constant 7 : index
+    %f = cast.tofelt %i : index, !felt.type<"bn254">
+    %one = felt.const 1 <"bn254">
+    %r = felt.add %f, %one : !felt.type<"bn254">, !felt.type<"bn254">
+    function.return %r : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let result = interpreter
+        .run_function("@index_to_felt", &[])
+        .expect("function should run");
+
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(8))]);
+}

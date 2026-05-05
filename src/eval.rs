@@ -344,6 +344,29 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             return Ok(());
         }
 
+        if dialect::cast::is_cast_tofelt(op) {
+            let ops = operands(op)?;
+            let value = frame
+                .get(ops[0])
+                .cloned()
+                .ok_or_else(|| Error::MissingValue("missing cast.tofelt operand".into()))?;
+            let felt = match value {
+                Value::Felt(felt) => felt,
+                Value::Index(index) => Felt::from_u64(index as u64),
+                Value::Bool(b) => Felt::from_u64(b as u64),
+                other => {
+                    return Err(Error::TypeError(format!(
+                        "expected felt, index, or bool for cast.tofelt, got {other}"
+                    )));
+                }
+            };
+            frame.insert(
+                op.result(0).map_err(Error::from)?.into(),
+                Value::Felt(felt),
+            );
+            return Ok(());
+        }
+
         if dialect::felt::is_felt_add(op)
             || dialect::felt::is_felt_sub(op)
             || dialect::felt::is_felt_mul(op)
