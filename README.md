@@ -18,7 +18,7 @@ Implemented runtime support includes:
 - `cast.toindex`, `cast.tofelt`
 - `array.new`, `array.read`, `array.write`
 - `ram.load`, `ram.store` (flat felt memory; unwritten cells read as zero)
-- `scf.if`, `scf.yield`
+- `scf.if`, `scf.while`, `scf.condition`, `scf.yield`
 - `llzk.nondet` (resolved from a pre-supplied FIFO queue via
   `Interpreter::set_nondet_values`, falls back to zero when empty)
 

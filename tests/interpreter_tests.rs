@@ -621,6 +621,74 @@ module attributes {llzk.lang} {
 }
 
 #[test]
+fn interprets_scf_while_sum_first_n() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @sum_first_n(%n: !felt.type<"bn254">) -> !felt.type<"bn254"> {
+    %zero = felt.const 0 <"bn254">
+    %one = felt.const 1 <"bn254">
+    %res:2 = scf.while (%i = %zero, %s = %zero) : (!felt.type<"bn254">, !felt.type<"bn254">) -> (!felt.type<"bn254">, !felt.type<"bn254">) {
+      %cond = bool.cmp lt(%i, %n) : !felt.type<"bn254">, !felt.type<"bn254">
+      scf.condition(%cond) %i, %s : !felt.type<"bn254">, !felt.type<"bn254">
+    } do {
+    ^bb0(%i_in: !felt.type<"bn254">, %s_in: !felt.type<"bn254">):
+      %i_next = felt.add %i_in, %one : !felt.type<"bn254">, !felt.type<"bn254">
+      %s_next = felt.add %s_in, %i_next : !felt.type<"bn254">, !felt.type<"bn254">
+      scf.yield %i_next, %s_next : !felt.type<"bn254">, !felt.type<"bn254">
+    }
+    function.return %res#1 : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let result = interpreter
+        .run_function("@sum_first_n", &[Value::Felt(Felt::from_u64(4))])
+        .expect("function should run");
+
+    // 1 + 2 + 3 + 4 = 10
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(10))]);
+}
+
+#[test]
+fn interprets_scf_while_zero_iterations() {
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @loop_zero() -> !felt.type<"bn254"> {
+    %zero = felt.const 0 <"bn254">
+    %one = felt.const 1 <"bn254">
+    %res = scf.while (%s = %zero) : (!felt.type<"bn254">) -> !felt.type<"bn254"> {
+      %cond = bool.cmp lt(%s, %zero) : !felt.type<"bn254">, !felt.type<"bn254">
+      scf.condition(%cond) %s : !felt.type<"bn254">
+    } do {
+    ^bb0(%s_in: !felt.type<"bn254">):
+      %s_next = felt.add %s_in, %one : !felt.type<"bn254">, !felt.type<"bn254">
+      scf.yield %s_next : !felt.type<"bn254">
+    }
+    function.return %res : !felt.type<"bn254">
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let result = interpreter
+        .run_function("@loop_zero", &[])
+        .expect("function should run");
+
+    assert_eq!(result, vec![Value::Felt(Felt::from_u64(0))]);
+}
+
+#[test]
 fn interprets_cast_tofelt_from_index() {
     let context = LlzkContext::new();
     let module = Module::parse(

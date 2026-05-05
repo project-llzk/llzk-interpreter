@@ -3,7 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use llzk::{
     dialect,
     prelude::{
-        FuncDefOpLike, FuncDefOpRef, Module, OperationLike, OperationRef, RegionLike,
+        BlockLike, FuncDefOpLike, FuncDefOpRef, Module, OperationLike, OperationRef, RegionLike,
         StructDefOpLike,
     },
 };
@@ -163,6 +163,104 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         }
         // If the region has no yield (e.g. zero results), that's fine.
         Ok(())
+    }
+
+    fn eval_scf_while(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
+        let before_block = op
+            .region(0)
+            .map_err(Error::from)?
+            .first_block()
+            .ok_or_else(|| Error::MalformedOp("scf.while before region without block".into()))?;
+        let after_block = op
+            .region(1)
+            .map_err(Error::from)?
+            .first_block()
+            .ok_or_else(|| Error::MalformedOp("scf.while after region without block".into()))?;
+
+        let init_operands = operands(op)?;
+        let mut current: Vec<Value> = init_operands
+            .into_iter()
+            .map(|operand| {
+                frame.get(operand).cloned().ok_or_else(|| {
+                    Error::MissingValue(format!("missing scf.while init operand {operand}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        loop {
+            for (idx, value) in current.iter().enumerate() {
+                let block_arg = before_block.argument(idx).map_err(Error::from)?;
+                frame.insert(block_arg.into(), value.clone());
+            }
+
+            let mut condition_holds = false;
+            let mut forwarded: Vec<Value> = Vec::new();
+            let mut saw_condition = false;
+            for inner_op in iter_block_ops(before_block) {
+                if dialect::scf_ext::is_scf_condition(&inner_op) {
+                    let cond_ops = operands(&inner_op)?;
+                    let (cond_operand, value_operands) = cond_ops.split_first().ok_or_else(|| {
+                        Error::MalformedOp("scf.condition missing predicate".into())
+                    })?;
+                    condition_holds = frame
+                        .get(*cond_operand)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::MissingValue("missing scf.condition predicate".into())
+                        })?
+                        .as_bool()
+                        .map_err(Error::TypeError)?;
+                    forwarded = value_operands
+                        .iter()
+                        .map(|v| {
+                            frame.get(*v).cloned().ok_or_else(|| {
+                                Error::MissingValue(format!("missing scf.condition forward {v}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    saw_condition = true;
+                    break;
+                }
+                self.eval_op(&inner_op, frame)?;
+            }
+            if !saw_condition {
+                return Err(Error::MalformedOp(
+                    "scf.while before region without scf.condition".into(),
+                ));
+            }
+
+            if !condition_holds {
+                for (idx, value) in forwarded.into_iter().enumerate() {
+                    frame.insert(op.result(idx).map_err(Error::from)?.into(), value);
+                }
+                return Ok(());
+            }
+
+            for (idx, value) in forwarded.iter().enumerate() {
+                let block_arg = after_block.argument(idx).map_err(Error::from)?;
+                frame.insert(block_arg.into(), value.clone());
+            }
+
+            let mut next: Option<Vec<Value>> = None;
+            for inner_op in iter_block_ops(after_block) {
+                if dialect::scf_ext::is_scf_yield(&inner_op) {
+                    let yielded = operands(&inner_op)?
+                        .into_iter()
+                        .map(|v| {
+                            frame.get(v).cloned().ok_or_else(|| {
+                                Error::MissingValue(format!("missing scf.yield operand {v}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    next = Some(yielded);
+                    break;
+                }
+                self.eval_op(&inner_op, frame)?;
+            }
+            current = next.ok_or_else(|| {
+                Error::MalformedOp("scf.while after region without scf.yield".into())
+            })?;
+        }
     }
 
     fn eval_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
@@ -520,6 +618,10 @@ impl<'c, 'm> Interpreter<'c, 'm> {
 
         if dialect::scf_ext::is_scf_if(op) {
             return self.eval_scf_if(op, frame);
+        }
+
+        if dialect::scf_ext::is_scf_while(op) {
+            return self.eval_scf_while(op, frame);
         }
 
         if op.name().as_string_ref().as_str() == Ok("bool.eq") {
