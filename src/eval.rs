@@ -19,7 +19,7 @@ use crate::{
         member_name, operands, parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate,
         parse_felt_const, result_struct_name,
     },
-    state::{ExecutionState, Frame},
+    state::{ExecutionState, Frame, Origin, Phase},
     value::{ArrayInstance, Felt, IntValue, StructInstance, Value},
 };
 
@@ -28,6 +28,7 @@ pub struct Interpreter<'c, 'm> {
     module: &'m Module<'c>,
     state: ExecutionState,
     nondet_queue: VecDeque<Felt>,
+    phase: Phase,
 }
 
 impl<'c, 'm> Interpreter<'c, 'm> {
@@ -37,6 +38,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             module,
             state: ExecutionState::default(),
             nondet_queue: VecDeque::new(),
+            phase: Phase::Compute,
         }
     }
 
@@ -55,7 +57,11 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         let compute = struct_def
             .get_compute_func()
             .ok_or_else(|| Error::SymbolNotFound(format!("compute for struct @{struct_name}")))?;
-        let results = self.execute_function(&compute, inputs)?;
+        let prev_phase = std::mem::replace(&mut self.phase, Phase::Compute);
+        let origins = vec![Origin::Dynamic; inputs.len()];
+        let result = self.execute_function(&compute, inputs, &origins);
+        self.phase = prev_phase;
+        let results = result?;
         let value = results
             .into_iter()
             .next()
@@ -78,20 +84,26 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         let mut args = Vec::with_capacity(inputs.len() + 1);
         args.push(Value::Struct(Rc::new(RefCell::new(self_value))));
         args.extend_from_slice(inputs);
-        let _ = self.execute_function(&constrain, &args)?;
+        let origins = vec![Origin::Dynamic; args.len()];
+        let prev_phase = std::mem::replace(&mut self.phase, Phase::Constrain);
+        let result = self.execute_function(&constrain, &args, &origins);
+        self.phase = prev_phase;
+        let _ = result?;
         Ok(())
     }
 
     /// Executes a fully qualified module-level or nested function name.
     pub fn run_function(&mut self, symbol: &str, args: &[Value]) -> Result<Vec<Value>> {
         let func = find_function(self.module, symbol)?;
-        self.execute_function(&func, args)
+        let origins = vec![Origin::Dynamic; args.len()];
+        self.execute_function(&func, args, &origins)
     }
 
     fn execute_function(
         &mut self,
         func: &FuncDefOpRef<'c, '_>,
         args: &[Value],
+        arg_origins: &[Origin],
     ) -> Result<Vec<Value>> {
         self.state.call_stack.push(fq_function_name(func));
 
@@ -104,7 +116,8 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         let mut frame = Frame::default();
         for (idx, arg) in args.iter().enumerate() {
             let block_arg = func.argument(idx).map_err(Error::from)?;
-            frame.insert(block_arg.into(), arg.clone());
+            let origin = arg_origins.get(idx).copied().unwrap_or(Origin::Dynamic);
+            frame.insert_with_origin(block_arg.into(), arg.clone(), origin);
         }
 
         let result = (|| {
@@ -512,6 +525,72 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     }
 
     fn eval_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
+        self.check_bool_assert_origin(op, frame)?;
+        self.dispatch_op(op, frame)?;
+        self.propagate_result_origins(op, frame);
+        Ok(())
+    }
+
+    /// Enforces the PCL backend rule: in `@constrain` (and helpers transitively
+    /// called from it), `bool.assert` is only lowered to a real polynomial
+    /// constraint when its condition folds to a static constant. A dynamic
+    /// condition silently disappears at proof time, which is a soundness gap.
+    fn check_bool_assert_origin(
+        &self,
+        op: &OperationRef<'c, '_>,
+        frame: &Frame,
+    ) -> Result<()> {
+        if self.phase != Phase::Constrain || !dialect::bool::is_bool_assert(op) {
+            return Ok(());
+        }
+        let ops = operands(op)?;
+        let cond = ops
+            .first()
+            .ok_or_else(|| Error::MalformedOp("bool.assert without operand".into()))?;
+        if frame.origin(*cond) != Origin::Const {
+            return Err(Error::ConstraintFailed(
+                "bool.assert in @constrain has a dynamic condition; PCL will not lower it. \
+                 Replace with `constrain.eq(cast.tofelt(<bool>), 1)`."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tags this op's result origins as `Const` iff all of its operands are
+    /// `Const` and the op itself isn't an intrinsic source of dynamic data
+    /// (`llzk.nondet`); known constant-producing ops are forced to `Const`.
+    fn propagate_result_origins(&self, op: &OperationRef<'c, '_>, frame: &mut Frame) {
+        let origin = if dialect::llzk::is_nondet(op) {
+            Origin::Dynamic
+        } else if is_const_producing_op(op) {
+            Origin::Const
+        } else {
+            let mut all_const = true;
+            for i in 0..op.operand_count() {
+                let Ok(operand) = op.operand(i) else {
+                    all_const = false;
+                    break;
+                };
+                if frame.origin(operand) != Origin::Const {
+                    all_const = false;
+                    break;
+                }
+            }
+            if all_const {
+                Origin::Const
+            } else {
+                Origin::Dynamic
+            }
+        };
+        for i in 0..op.result_count() {
+            if let Ok(result) = op.result(i) {
+                frame.set_origin(result.into(), origin);
+            }
+        }
+    }
+
+    fn dispatch_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
         if let Ok(name) = op.name().as_string_ref().as_str()
             && let Some(rest) = name.strip_prefix("arith.")
         {
@@ -979,16 +1058,33 @@ impl<'c, 'm> Interpreter<'c, 'm> {
 
         if dialect::function::is_func_call(op) {
             let symbol = call_target(op)?;
-            let args = operands(op)?
-                .into_iter()
+            let operand_values = operands(op)?;
+            let args = operand_values
+                .iter()
                 .map(|operand| {
-                    frame.get(operand).cloned().ok_or_else(|| {
+                    frame.get(*operand).cloned().ok_or_else(|| {
                         Error::MissingValue(format!("missing call operand {operand}"))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let arg_origins: Vec<Origin> = operand_values
+                .iter()
+                .map(|operand| frame.origin(*operand))
+                .collect();
             let callee = find_function(self.module, &symbol)?;
-            let results = self.execute_function(&callee, &args)?;
+            // Functions marked `allow_witness` are treated by PCL as witness
+            // oracles, not as constraint-emitting bodies, so `bool.assert`
+            // inside them (the Brillig trap idiom) is legitimate even when
+            // reached from `@constrain`.
+            let callee_phase = if callee.has_allow_witness_attr() {
+                Phase::Compute
+            } else {
+                self.phase
+            };
+            let prev_phase = std::mem::replace(&mut self.phase, callee_phase);
+            let results = self.execute_function(&callee, &args, &arg_origins);
+            self.phase = prev_phase;
+            let results = results?;
             for (index, value) in results.into_iter().enumerate() {
                 frame.insert(op.result(index).map_err(Error::from)?.into(), value);
             }
@@ -1037,6 +1133,20 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             .to_string();
         Err(Error::UnsupportedOp(op_name))
     }
+}
+
+/// Ops that produce values directly from their attributes (no SSA operands)
+/// and therefore always count as `Origin::Const` regardless of context.
+fn is_const_producing_op<'c, 'a>(op: &OperationRef<'c, 'a>) -> bool {
+    if dialect::felt::is_felt_const(op) {
+        return true;
+    }
+    let name = op.name();
+    let name_ref = name.as_string_ref();
+    let Ok(name_str) = name_ref.as_str() else {
+        return false;
+    };
+    matches!(name_str, "arith.constant" | "index.constant")
 }
 
 fn value_as_signed(value: &Value) -> Result<BigInt> {

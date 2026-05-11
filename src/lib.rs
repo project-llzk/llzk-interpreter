@@ -6,7 +6,7 @@ mod state;
 mod value;
 
 pub use eval::Interpreter;
-pub use state::{ConstraintRecord, ExecutionState};
+pub use state::{ConstraintRecord, ExecutionState, Origin, Phase};
 pub use value::{ArrayInstance, Felt, IntValue, StructInstance, Value};
 
 /// Interpreter error.
