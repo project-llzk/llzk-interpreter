@@ -15,21 +15,72 @@ pub struct ConstraintRecord {
     pub satisfied: bool,
 }
 
+/// Whether the running function body is a witness-generation body (`@compute`,
+/// Brillig, helpers called from those) or a constraint body (`@constrain` and
+/// any helper transitively reached from it).
+///
+/// Only `Constrain` triggers the soundness checks that mirror what the proof
+/// backend can actually lower to polynomial constraints.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Compute,
+    Constrain,
+}
+
+/// Origin of an SSA value: a `Const` value's def chain folds to compile-time
+/// constants; a `Dynamic` value depends on a nondet or a function argument.
+///
+/// PCL only lowers `bool.assert` in `@constrain` when its operand is `Const`,
+/// so `bool.assert(Dynamic)` is a silent no-op in the prover and must error.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Const,
+    Dynamic,
+}
+
 /// One function activation record.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     bindings: HashMap<usize, Value>,
+    origins: HashMap<usize, Origin>,
 }
 
 impl Frame {
-    /// Inserts a runtime value for an SSA value.
+    /// Inserts a runtime value for an SSA value. The origin defaults to
+    /// `Dynamic`; callers may override with [`Frame::set_origin`].
     pub fn insert<'c, 'a>(&mut self, key: MlirValue<'c, 'a>, value: Value) {
         self.bindings.insert(value_key(key), value);
+    }
+
+    /// Inserts a runtime value together with its provenance.
+    pub fn insert_with_origin<'c, 'a>(
+        &mut self,
+        key: MlirValue<'c, 'a>,
+        value: Value,
+        origin: Origin,
+    ) {
+        let k = value_key(key);
+        self.bindings.insert(k, value);
+        self.origins.insert(k, origin);
     }
 
     /// Retrieves a runtime value for an SSA value.
     pub fn get<'c, 'a>(&self, key: MlirValue<'c, 'a>) -> Option<&Value> {
         self.bindings.get(&value_key(key))
+    }
+
+    /// Overrides the origin tag of an already-inserted value.
+    pub fn set_origin<'c, 'a>(&mut self, key: MlirValue<'c, 'a>, origin: Origin) {
+        self.origins.insert(value_key(key), origin);
+    }
+
+    /// Returns the origin tag of an SSA value, defaulting to `Dynamic` for
+    /// values inserted without explicit provenance.
+    pub fn origin<'c, 'a>(&self, key: MlirValue<'c, 'a>) -> Origin {
+        self.origins
+            .get(&value_key(key))
+            .copied()
+            .unwrap_or(Origin::Dynamic)
     }
 }
 

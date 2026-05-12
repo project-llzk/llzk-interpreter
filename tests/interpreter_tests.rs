@@ -1176,6 +1176,165 @@ module attributes {llzk.lang} {
 }
 
 #[test]
+fn bool_assert_in_constrain_rejects_dynamic_condition() {
+    // The condition `%bit < 2` traces back to a struct member (witness),
+    // so PCL would not lower this `bool.assert` to a real constraint.
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  struct.def @BadBit {
+    struct.member @bit : !felt.type<"bn254"> {llzk.pub}
+    function.def @compute(%b: !felt.type<"bn254">) -> !struct.type<@BadBit> {
+      %self = struct.new : !struct.type<@BadBit>
+      struct.writem %self[@bit] = %b : !struct.type<@BadBit>, !felt.type<"bn254">
+      function.return %self : !struct.type<@BadBit>
+    }
+    function.def @constrain(%self: !struct.type<@BadBit>, %b: !felt.type<"bn254">) {
+      %bit = struct.readm %self[@bit] : !struct.type<@BadBit>, !felt.type<"bn254">
+      %two = felt.const 2 <"bn254">
+      %ok = bool.cmp lt(%bit, %two) : !felt.type<"bn254">, !felt.type<"bn254">
+      bool.assert %ok
+      function.return
+    }
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let computed = interpreter
+        .run_compute("BadBit", &[Value::Felt(Felt::from_u64(1))])
+        .expect("compute should succeed");
+    let err = interpreter
+        .run_constrain("BadBit", computed, &[Value::Felt(Felt::from_u64(1))])
+        .expect_err("constrain should reject dynamic bool.assert");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dynamic condition"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[test]
+fn bool_assert_in_constrain_accepts_static_condition() {
+    // Both `bool.cmp` operands are `felt.const`, so the condition folds to a
+    // constant and PCL would emit it as a real polynomial constraint.
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  struct.def @StaticOk {
+    struct.member @x : !felt.type<"bn254"> {llzk.pub}
+    function.def @compute(%a: !felt.type<"bn254">) -> !struct.type<@StaticOk> {
+      %self = struct.new : !struct.type<@StaticOk>
+      struct.writem %self[@x] = %a : !struct.type<@StaticOk>, !felt.type<"bn254">
+      function.return %self : !struct.type<@StaticOk>
+    }
+    function.def @constrain(%self: !struct.type<@StaticOk>, %a: !felt.type<"bn254">) {
+      %one = felt.const 1 <"bn254">
+      %two = felt.const 2 <"bn254">
+      %ok = bool.cmp lt(%one, %two) : !felt.type<"bn254">, !felt.type<"bn254">
+      bool.assert %ok
+      function.return
+    }
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let computed = interpreter
+        .run_compute("StaticOk", &[Value::Felt(Felt::from_u64(0))])
+        .expect("compute should succeed");
+    interpreter
+        .run_constrain("StaticOk", computed, &[Value::Felt(Felt::from_u64(0))])
+        .expect("constrain with static bool.assert should succeed");
+}
+
+#[test]
+fn bool_assert_in_compute_allows_dynamic_condition() {
+    // Same body shape, but executed via `@compute` — `bool.assert` is the
+    // Brillig trap idiom there, so it should remain a runtime check only.
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  struct.def @Bit {
+    struct.member @bit : !felt.type<"bn254"> {llzk.pub}
+    function.def @compute(%b: !felt.type<"bn254">) -> !struct.type<@Bit> {
+      %two = felt.const 2 <"bn254">
+      %ok = bool.cmp lt(%b, %two) : !felt.type<"bn254">, !felt.type<"bn254">
+      bool.assert %ok
+      %self = struct.new : !struct.type<@Bit>
+      struct.writem %self[@bit] = %b : !struct.type<@Bit>, !felt.type<"bn254">
+      function.return %self : !struct.type<@Bit>
+    }
+    function.def @constrain(%self: !struct.type<@Bit>, %b: !felt.type<"bn254">) {
+      function.return
+    }
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    interpreter
+        .run_compute("Bit", &[Value::Felt(Felt::from_u64(1))])
+        .expect("compute should allow dynamic bool.assert");
+}
+
+#[test]
+fn bool_assert_in_constrain_helper_rejects_dynamic_condition() {
+    // The dynamic operand crosses a `function.call` boundary: the helper's
+    // `bool.assert` operand traces back through an arg origin, which we
+    // propagate from the caller, so the check still fires.
+    let context = LlzkContext::new();
+    let module = Module::parse(
+        &context,
+        r#"
+module attributes {llzk.lang} {
+  function.def @range_check(%v: !felt.type<"bn254">) {
+    %two = felt.const 2 <"bn254">
+    %ok = bool.cmp lt(%v, %two) : !felt.type<"bn254">, !felt.type<"bn254">
+    bool.assert %ok
+    function.return
+  }
+  struct.def @BadBitHelper {
+    struct.member @bit : !felt.type<"bn254"> {llzk.pub}
+    function.def @compute(%b: !felt.type<"bn254">) -> !struct.type<@BadBitHelper> {
+      %self = struct.new : !struct.type<@BadBitHelper>
+      struct.writem %self[@bit] = %b : !struct.type<@BadBitHelper>, !felt.type<"bn254">
+      function.return %self : !struct.type<@BadBitHelper>
+    }
+    function.def @constrain(%self: !struct.type<@BadBitHelper>, %b: !felt.type<"bn254">) {
+      %bit = struct.readm %self[@bit] : !struct.type<@BadBitHelper>, !felt.type<"bn254">
+      function.call @range_check(%bit) : (!felt.type<"bn254">) -> ()
+      function.return
+    }
+  }
+}
+"#,
+    )
+    .expect("module should parse");
+
+    let mut interpreter = Interpreter::new(&module);
+    let computed = interpreter
+        .run_compute("BadBitHelper", &[Value::Felt(Felt::from_u64(1))])
+        .expect("compute should succeed");
+    let err = interpreter
+        .run_constrain("BadBitHelper", computed, &[Value::Felt(Felt::from_u64(1))])
+        .expect_err("constrain should reject dynamic bool.assert in helper");
+    assert!(err.to_string().contains("dynamic condition"));
+}
+
+#[test]
 fn arith_remui_by_zero_on_index_fails() {
     let context = LlzkContext::new();
     let module = Module::parse(
