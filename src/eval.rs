@@ -4,45 +4,66 @@ use llzk::{
     dialect,
     prelude::{
         BlockLike, FuncDefOpLike, FuncDefOpRef, IntegerType, Module, OperationLike, OperationRef,
-        RegionLike, StructDefOpLike, TypeLike, ValueLike,
+        RegionLike, StructDefOpLike, StructDefOpRef, TypeLike, ValueLike,
     },
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::{
     Error, Result,
     dispatch::{
-        CmpIPredicate, call_target, find_function, find_struct, fq_function_name, iter_block_ops,
-        member_name, operands, parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate,
-        parse_felt_const, result_struct_name,
+        CmpIPredicate, call_target, fq_function_name, iter_block_ops, member_name, operands,
+        parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate, parse_felt_const,
+        result_struct_name,
     },
-    state::{ExecutionState, Frame, Origin, Phase},
+    state::{ExecutionState, Frame, Origin, Phase, Stats},
     value::{ArrayInstance, Felt, IntValue, StructInstance, Value},
 };
 
 /// Concrete interpreter for a small LLZK subset.
 pub struct Interpreter<'c, 'm> {
-    module: &'m Module<'c>,
     state: ExecutionState,
     nondet_queue: VecDeque<Felt>,
     phase: Phase,
+    /// Pre-populated function and struct lookup tables. Built once in
+    /// [`Interpreter::new`] by walking the module body. The underlying scan
+    /// is extremely expensive on large modules because `StructDefOpRef::try_from`
+    /// stringifies + verifies each candidate op — doing it once at construction
+    /// avoids paying that cost per `function.call`.
+    function_cache: HashMap<String, FuncDefOpRef<'c, 'm>>,
+    struct_cache: HashMap<String, StructDefOpRef<'c, 'm>>,
 }
 
 impl<'c, 'm> Interpreter<'c, 'm> {
-    /// Creates a new interpreter for the given module.
     pub fn new(module: &'m Module<'c>) -> Self {
+        let mut state = ExecutionState::default();
+        let (function_cache, struct_cache) = build_symbol_caches(module, &mut state.stats);
         Self {
-            module,
-            state: ExecutionState::default(),
+            state,
             nondet_queue: VecDeque::new(),
             phase: Phase::Compute,
+            function_cache,
+            struct_cache,
         }
     }
 
-    /// Returns the collected constraint checks.
+    fn lookup_function(&self, symbol: &str) -> Result<FuncDefOpRef<'c, 'm>> {
+        self.function_cache
+            .get(symbol)
+            .copied()
+            .ok_or_else(|| Error::SymbolNotFound(format!("function {symbol}")))
+    }
+
+    fn lookup_struct(&self, name: &str) -> Result<StructDefOpRef<'c, 'm>> {
+        self.struct_cache
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::SymbolNotFound(format!("struct @{name}")))
+    }
+
     pub fn state(&self) -> &ExecutionState {
         &self.state
     }
@@ -51,9 +72,8 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         self.nondet_queue = values.into_iter().collect();
     }
 
-    /// Executes `@Struct::@compute` and returns the resulting struct instance.
     pub fn run_compute(&mut self, struct_name: &str, inputs: &[Value]) -> Result<StructInstance> {
-        let struct_def = find_struct(self.module, struct_name)?;
+        let struct_def = self.lookup_struct(struct_name)?;
         let compute = struct_def
             .get_compute_func()
             .ok_or_else(|| Error::SymbolNotFound(format!("compute for struct @{struct_name}")))?;
@@ -70,14 +90,13 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         Ok(struct_ref.borrow().clone())
     }
 
-    /// Executes `@Struct::@constrain` against a concrete self value and inputs.
     pub fn run_constrain(
         &mut self,
         struct_name: &str,
         self_value: StructInstance,
         inputs: &[Value],
     ) -> Result<()> {
-        let struct_def = find_struct(self.module, struct_name)?;
+        let struct_def = self.lookup_struct(struct_name)?;
         let constrain = struct_def
             .get_constrain_func()
             .ok_or_else(|| Error::SymbolNotFound(format!("constrain for struct @{struct_name}")))?;
@@ -92,9 +111,8 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         Ok(())
     }
 
-    /// Executes a fully qualified module-level or nested function name.
     pub fn run_function(&mut self, symbol: &str, args: &[Value]) -> Result<Vec<Value>> {
-        let func = find_function(self.module, symbol)?;
+        let func = self.lookup_function(symbol)?;
         let origins = vec![Origin::Dynamic; args.len()];
         self.execute_function(&func, args, &origins)
     }
@@ -105,6 +123,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
         args: &[Value],
         arg_origins: &[Origin],
     ) -> Result<Vec<Value>> {
+        self.state.stats.execute_function_invocations += 1;
         self.state.call_stack.push(fq_function_name(func));
 
         let block = func
@@ -155,17 +174,15 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             .as_bool()
             .map_err(Error::TypeError)?;
 
-        // scf.if has two regions: then (index 0) and else (index 1).
+        // Region 0 is `then`, region 1 is `else`.
         let region_index = if condition { 0 } else { 1 };
         let region = op.region(region_index).map_err(Error::from)?;
         let block = region
             .first_block()
             .ok_or_else(|| Error::MalformedOp("scf.if region without block".into()))?;
 
-        // Execute the block. scf.yield terminates it.
         for inner_op in iter_block_ops(block) {
             if dialect::scf_ext::is_scf_yield(&inner_op) {
-                // Bind yielded values to the scf.if results.
                 let yield_operands = operands(&inner_op)?;
                 for (index, yield_val) in yield_operands.into_iter().enumerate() {
                     let value = frame.get(yield_val).cloned().ok_or_else(|| {
@@ -177,7 +194,6 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             }
             self.eval_op(&inner_op, frame)?;
         }
-        // If the region has no yield (e.g. zero results), that's fine.
         Ok(())
     }
 
@@ -215,9 +231,10 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             for inner_op in iter_block_ops(before_block) {
                 if dialect::scf_ext::is_scf_condition(&inner_op) {
                     let cond_ops = operands(&inner_op)?;
-                    let (cond_operand, value_operands) = cond_ops.split_first().ok_or_else(|| {
-                        Error::MalformedOp("scf.condition missing predicate".into())
-                    })?;
+                    let (cond_operand, value_operands) =
+                        cond_ops.split_first().ok_or_else(|| {
+                            Error::MalformedOp("scf.condition missing predicate".into())
+                        })?;
                     condition_holds = frame
                         .get(*cond_operand)
                         .cloned()
@@ -369,7 +386,13 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             .ok_or_else(|| Error::MissingValue("missing arith.cmpi rhs".into()))?;
 
         let result = match (&lhs, &rhs) {
-            (Value::Index(a), Value::Index(b)) => cmpi_unsigned(predicate, &BigInt::from(*a), &BigInt::from(*b), &BigUint::from(*a), &BigUint::from(*b)),
+            (Value::Index(a), Value::Index(b)) => cmpi_unsigned(
+                predicate,
+                &BigInt::from(*a),
+                &BigInt::from(*b),
+                &BigUint::from(*a),
+                &BigUint::from(*b),
+            ),
             (Value::Int(a), Value::Int(b)) => {
                 if a.width() != b.width() {
                     return Err(Error::TypeError(format!(
@@ -378,12 +401,26 @@ impl<'c, 'm> Interpreter<'c, 'm> {
                         b.width()
                     )));
                 }
-                cmpi_unsigned(predicate, &a.as_signed(), &b.as_signed(), a.as_unsigned(), b.as_unsigned())
+                cmpi_unsigned(
+                    predicate,
+                    &a.as_signed(),
+                    &b.as_signed(),
+                    a.as_unsigned(),
+                    b.as_unsigned(),
+                )
             }
             (Value::Bool(a), Value::Bool(b)) => {
                 // i1 signed interpretation: 1 -> -1, 0 -> 0.
-                let av = if *a { BigInt::from(-1i64) } else { BigInt::from(0) };
-                let bv = if *b { BigInt::from(-1i64) } else { BigInt::from(0) };
+                let av = if *a {
+                    BigInt::from(-1i64)
+                } else {
+                    BigInt::from(0)
+                };
+                let bv = if *b {
+                    BigInt::from(-1i64)
+                } else {
+                    BigInt::from(0)
+                };
                 let au = BigUint::from(*a as u64);
                 let bu = BigUint::from(*b as u64);
                 cmpi_unsigned(predicate, &av, &bv, &au, &bu)
@@ -474,13 +511,11 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             "index_cast" => {
                 if result_ty.is_index() {
                     let signed = value_as_signed(&operand)?;
-                    let unsigned = signed
-                        .to_biguint()
-                        .ok_or_else(|| {
-                            Error::TypeError(
-                                "arith.index_cast cannot convert negative value to index".into(),
-                            )
-                        })?;
+                    let unsigned = signed.to_biguint().ok_or_else(|| {
+                        Error::TypeError(
+                            "arith.index_cast cannot convert negative value to index".into(),
+                        )
+                    })?;
                     let idx: usize = unsigned.try_into().map_err(|_| {
                         Error::TypeError("arith.index_cast value too large for usize".into())
                     })?;
@@ -525,9 +560,18 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     }
 
     fn eval_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
-        self.check_bool_assert_origin(op, frame)?;
+        self.state.stats.op_dispatches += 1;
+        // Origin tracking only feeds the bool.assert soundness check in
+        // `@constrain`. In `@compute` we'd compute origins nobody reads, so
+        // skip the per-op operand/result FFI walks entirely.
+        let track_origins = self.phase == Phase::Constrain;
+        if track_origins {
+            self.check_bool_assert_origin(op, frame)?;
+        }
         self.dispatch_op(op, frame)?;
-        self.propagate_result_origins(op, frame);
+        if track_origins {
+            self.propagate_result_origins(op, frame);
+        }
         Ok(())
     }
 
@@ -535,11 +579,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     /// called from it), `bool.assert` is only lowered to a real polynomial
     /// constraint when its condition folds to a static constant. A dynamic
     /// condition silently disappears at proof time, which is a soundness gap.
-    fn check_bool_assert_origin(
-        &self,
-        op: &OperationRef<'c, '_>,
-        frame: &Frame,
-    ) -> Result<()> {
+    fn check_bool_assert_origin(&self, op: &OperationRef<'c, '_>, frame: &Frame) -> Result<()> {
         if self.phase != Phase::Constrain || !dialect::bool::is_bool_assert(op) {
             return Ok(());
         }
@@ -591,552 +631,538 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     }
 
     fn dispatch_op(&mut self, op: &OperationRef<'c, '_>, frame: &mut Frame) -> Result<()> {
-        if let Ok(name) = op.name().as_string_ref().as_str()
-            && let Some(rest) = name.strip_prefix("arith.")
-        {
+        let op_name = op.name();
+        let op_name_ref = op_name.as_string_ref();
+        let name = match op_name_ref.as_str() {
+            Ok(n) => n,
+            Err(_) => return Err(Error::UnsupportedOp("<unknown-op>".into())),
+        };
+
+        if let Some(rest) = name.strip_prefix("arith.") {
             return self.eval_arith_op(rest, op, frame);
         }
 
-        if dialect::llzk::is_nondet(op) {
-            // Pull from the pre-supplied queue, falling back to zero.
-            let value = self.nondet_queue.pop_front().unwrap_or_else(Felt::zero);
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(value),
-            );
-            return Ok(());
-        }
+        match name {
+            "llzk.nondet" => {
+                let value = self.nondet_queue.pop_front().unwrap_or_else(Felt::zero);
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(value),
+                );
+                Ok(())
+            }
 
-        if dialect::r#struct::is_struct_new(op) {
-            let struct_name = result_struct_name(op)?;
-            let value = Value::Struct(Rc::new(RefCell::new(StructInstance::new(struct_name))));
-            frame.insert(op.result(0).map_err(Error::from)?.into(), value);
-            return Ok(());
-        }
+            "struct.new" => {
+                let struct_name = result_struct_name(op)?;
+                let value = Value::Struct(Rc::new(RefCell::new(StructInstance::new(struct_name))));
+                frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+                Ok(())
+            }
 
-        if dialect::array::is_array_new(op) {
-            let values = operands(op)?
-                .into_iter()
-                .map(|operand| {
-                    frame.get(operand).cloned().ok_or_else(|| {
-                        Error::MissingValue(format!("missing array.new operand {operand}"))
+            "array.new" => {
+                let values = operands(op)?
+                    .into_iter()
+                    .map(|operand| {
+                        frame.get(operand).cloned().ok_or_else(|| {
+                            Error::MissingValue(format!("missing array.new operand {operand}"))
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let array = if values.is_empty() {
-                ArrayInstance::new()
-            } else {
-                ArrayInstance::from_values(values)
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Array(Rc::new(RefCell::new(array))),
-            );
-            return Ok(());
-        }
+                    .collect::<Result<Vec<_>>>()?;
+                let array = if values.is_empty() {
+                    ArrayInstance::new()
+                } else {
+                    ArrayInstance::from_values(values)
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Array(Rc::new(RefCell::new(array))),
+                );
+                Ok(())
+            }
 
-        if dialect::array::is_array_write(op) {
-            let ops = operands(op)?;
-            let (array_operand, rest) = ops
-                .split_first()
-                .ok_or_else(|| Error::MalformedOp("array.write missing array operand".into()))?;
-            let (value_operand, index_operands) = rest
-                .split_last()
-                .ok_or_else(|| Error::MalformedOp("array.write missing value operand".into()))?;
-            let array = frame
-                .get(*array_operand)
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing array.write array".into()))?
-                .as_array()
-                .map_err(Error::TypeError)?;
-            let indices = index_operands
-                .iter()
-                .map(|index| {
-                    frame
-                        .get(*index)
-                        .cloned()
-                        .ok_or_else(|| {
-                            Error::MissingValue(format!("missing array.write index {index}"))
-                        })?
-                        .as_index()
-                        .map_err(Error::TypeError)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let value = frame
-                .get(*value_operand)
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing array.write value".into()))?;
-            array.borrow_mut().write(&indices, value);
-            return Ok(());
-        }
+            "array.write" => {
+                let ops = operands(op)?;
+                let (array_operand, rest) = ops.split_first().ok_or_else(|| {
+                    Error::MalformedOp("array.write missing array operand".into())
+                })?;
+                let (value_operand, index_operands) = rest.split_last().ok_or_else(|| {
+                    Error::MalformedOp("array.write missing value operand".into())
+                })?;
+                let array = frame
+                    .get(*array_operand)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing array.write array".into()))?
+                    .as_array()
+                    .map_err(Error::TypeError)?;
+                let indices = index_operands
+                    .iter()
+                    .map(|index| {
+                        frame
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::MissingValue(format!("missing array.write index {index}"))
+                            })?
+                            .as_index()
+                            .map_err(Error::TypeError)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let value = frame
+                    .get(*value_operand)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing array.write value".into()))?;
+                array.borrow_mut().write(&indices, value);
+                Ok(())
+            }
 
-        if dialect::array::is_array_read(op) {
-            let ops = operands(op)?;
-            let (array_operand, index_operands) = ops
-                .split_first()
-                .ok_or_else(|| Error::MalformedOp("array.read missing array operand".into()))?;
-            let array = frame
-                .get(*array_operand)
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing array.read array".into()))?
-                .as_array()
-                .map_err(Error::TypeError)?;
-            let indices = index_operands
-                .iter()
-                .map(|index| {
-                    frame
-                        .get(*index)
-                        .cloned()
-                        .ok_or_else(|| {
-                            Error::MissingValue(format!("missing array.read index {index}"))
-                        })?
-                        .as_index()
-                        .map_err(Error::TypeError)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let value = array
-                .borrow()
-                .read(&indices)
-                .ok_or_else(|| Error::MissingValue(format!("missing array element {indices:?}")))?;
-            frame.insert(op.result(0).map_err(Error::from)?.into(), value);
-            return Ok(());
-        }
+            "array.read" => {
+                let ops = operands(op)?;
+                let (array_operand, index_operands) = ops
+                    .split_first()
+                    .ok_or_else(|| Error::MalformedOp("array.read missing array operand".into()))?;
+                let array = frame
+                    .get(*array_operand)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing array.read array".into()))?
+                    .as_array()
+                    .map_err(Error::TypeError)?;
+                let indices = index_operands
+                    .iter()
+                    .map(|index| {
+                        frame
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::MissingValue(format!("missing array.read index {index}"))
+                            })?
+                            .as_index()
+                            .map_err(Error::TypeError)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let value = array.borrow().read(&indices).ok_or_else(|| {
+                    Error::MissingValue(format!("missing array element {indices:?}"))
+                })?;
+                frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+                Ok(())
+            }
 
-        if dialect::r#struct::is_struct_writem(op) {
-            let member = member_name(op)?;
-            let ops = operands(op)?;
-            let target = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing struct.writem target".into()))?;
-            let value = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing struct.writem value".into()))?;
-            let struct_ref = target.as_struct().map_err(Error::TypeError)?;
-            struct_ref.borrow_mut().members.insert(member, value);
-            return Ok(());
-        }
+            "struct.writem" => {
+                let member = member_name(op)?;
+                let ops = operands(op)?;
+                let target = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing struct.writem target".into()))?;
+                let value = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing struct.writem value".into()))?;
+                let struct_ref = target.as_struct().map_err(Error::TypeError)?;
+                struct_ref.borrow_mut().members.insert(member, value);
+                Ok(())
+            }
 
-        if dialect::r#struct::is_struct_readm(op) {
-            let member = member_name(op)?;
-            let ops = operands(op)?;
-            let target = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing struct.readm target".into()))?;
-            let struct_ref = target.as_struct().map_err(Error::TypeError)?;
-            let value = struct_ref
-                .borrow()
-                .members
-                .get(&member)
-                .cloned()
-                .ok_or_else(|| Error::MissingValue(format!("missing struct member {member}")))?;
-            frame.insert(op.result(0).map_err(Error::from)?.into(), value);
-            return Ok(());
-        }
+            "struct.readm" => {
+                let member = member_name(op)?;
+                let ops = operands(op)?;
+                let target = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing struct.readm target".into()))?;
+                let struct_ref = target.as_struct().map_err(Error::TypeError)?;
+                let value = struct_ref
+                    .borrow()
+                    .members
+                    .get(&member)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::MissingValue(format!("missing struct member {member}"))
+                    })?;
+                frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+                Ok(())
+            }
 
-        if dialect::felt::is_felt_const(op) {
-            let attr = op.attribute("value").map_err(Error::from)?;
-            let value = Value::Felt(parse_felt_const(attr)?);
-            frame.insert(op.result(0).map_err(Error::from)?.into(), value);
-            return Ok(());
-        }
+            "felt.const" => {
+                let attr = op.attribute("value").map_err(Error::from)?;
+                let value = Value::Felt(parse_felt_const(attr)?);
+                frame.insert(op.result(0).map_err(Error::from)?.into(), value);
+                Ok(())
+            }
 
-        if dialect::cast::is_cast_toindex(op) {
-            let ops = operands(op)?;
-            let value = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing cast.toindex operand".into()))?;
-            let index = match value {
-                Value::Index(index) => index,
-                Value::Felt(felt) => felt
+            "cast.toindex" => {
+                let ops = operands(op)?;
+                let value = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing cast.toindex operand".into()))?;
+                let index = match value {
+                    Value::Index(index) => index,
+                    Value::Felt(felt) => felt
+                        .as_biguint()
+                        .try_into()
+                        .map_err(|_| Error::TypeError("felt does not fit in usize index".into()))?,
+                    other => {
+                        return Err(Error::TypeError(format!(
+                            "expected felt or index for cast.toindex, got {other}"
+                        )));
+                    }
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Index(index),
+                );
+                Ok(())
+            }
+
+            "cast.tofelt" => {
+                let ops = operands(op)?;
+                let value = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing cast.tofelt operand".into()))?;
+                let felt = match value {
+                    Value::Felt(felt) => felt,
+                    Value::Index(index) => Felt::from_u64(index as u64),
+                    Value::Bool(b) => Felt::from_u64(b as u64),
+                    other => {
+                        return Err(Error::TypeError(format!(
+                            "expected felt, index, or bool for cast.tofelt, got {other}"
+                        )));
+                    }
+                };
+                frame.insert(op.result(0).map_err(Error::from)?.into(), Value::Felt(felt));
+                Ok(())
+            }
+
+            "felt.add" | "felt.sub" | "felt.mul" | "felt.div" | "felt.uintdiv" | "felt.umod" => {
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt lhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt rhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let value = match name {
+                    "felt.add" => lhs + rhs,
+                    "felt.sub" => lhs - rhs,
+                    "felt.mul" => lhs * rhs,
+                    "felt.div" => lhs / rhs,
+                    "felt.uintdiv" => Felt::new(lhs.as_biguint() / rhs.as_biguint()),
+                    "felt.umod" => Felt::new(lhs.as_biguint() % rhs.as_biguint()),
+                    _ => unreachable!(),
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(value),
+                );
+                Ok(())
+            }
+
+            "felt.neg" => {
+                let ops = operands(op)?;
+                let value = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt.neg operand".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(-value),
+                );
+                Ok(())
+            }
+
+            "felt.bit_and" | "felt.bit_or" | "felt.bit_xor" => {
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt bitwise lhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt bitwise rhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let value = match name {
+                    "felt.bit_and" => lhs.bit_and(&rhs),
+                    "felt.bit_or" => lhs.bit_or(&rhs),
+                    "felt.bit_xor" => lhs.bit_xor(&rhs),
+                    _ => unreachable!(),
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(value),
+                );
+                Ok(())
+            }
+
+            "felt.shl" | "felt.shr" => {
+                let ops = operands(op)?;
+                let value = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt shift value".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let amount = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt shift amount".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let amount_u32: u32 = amount
                     .as_biguint()
                     .try_into()
-                    .map_err(|_| Error::TypeError("felt does not fit in usize index".into()))?,
-                other => {
-                    return Err(Error::TypeError(format!(
-                        "expected felt or index for cast.toindex, got {other}"
-                    )));
-                }
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Index(index),
-            );
-            return Ok(());
-        }
-
-        if dialect::cast::is_cast_tofelt(op) {
-            let ops = operands(op)?;
-            let value = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing cast.tofelt operand".into()))?;
-            let felt = match value {
-                Value::Felt(felt) => felt,
-                Value::Index(index) => Felt::from_u64(index as u64),
-                Value::Bool(b) => Felt::from_u64(b as u64),
-                other => {
-                    return Err(Error::TypeError(format!(
-                        "expected felt, index, or bool for cast.tofelt, got {other}"
-                    )));
-                }
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(felt),
-            );
-            return Ok(());
-        }
-
-        if dialect::felt::is_felt_add(op)
-            || dialect::felt::is_felt_sub(op)
-            || dialect::felt::is_felt_mul(op)
-            || dialect::felt::is_felt_div(op)
-            || dialect::felt::is_felt_uintdiv(op)
-            || dialect::felt::is_felt_umod(op)
-        {
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt lhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt rhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let value = if dialect::felt::is_felt_add(op) {
-                lhs + rhs
-            } else if dialect::felt::is_felt_sub(op) {
-                lhs - rhs
-            } else if dialect::felt::is_felt_mul(op) {
-                lhs * rhs
-            } else if dialect::felt::is_felt_div(op) {
-                lhs / rhs
-            } else if dialect::felt::is_felt_uintdiv(op) {
-                Felt::new(lhs.as_biguint() / rhs.as_biguint())
-            } else {
-                Felt::new(lhs.as_biguint() % rhs.as_biguint())
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(value),
-            );
-            return Ok(());
-        }
-
-        if dialect::felt::is_felt_neg(op) {
-            let ops = operands(op)?;
-            let value = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt.neg operand".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(-value),
-            );
-            return Ok(());
-        }
-
-        if dialect::felt::is_felt_bit_and(op)
-            || dialect::felt::is_felt_bit_or(op)
-            || dialect::felt::is_felt_bit_xor(op)
-        {
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt bitwise lhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt bitwise rhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let value = if dialect::felt::is_felt_bit_and(op) {
-                lhs.bit_and(&rhs)
-            } else if dialect::felt::is_felt_bit_or(op) {
-                lhs.bit_or(&rhs)
-            } else {
-                lhs.bit_xor(&rhs)
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(value),
-            );
-            return Ok(());
-        }
-
-        if dialect::felt::is_felt_shl(op) || dialect::felt::is_felt_shr(op) {
-            let ops = operands(op)?;
-            let value = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt shift value".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let amount = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt shift amount".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let amount_u32: u32 = amount
-                .as_biguint()
-                .try_into()
-                .map_err(|_| Error::MalformedOp("shift amount too large".into()))?;
-            let result = if dialect::felt::is_felt_shl(op) {
-                value.shl(amount_u32)
-            } else {
-                value.shr(amount_u32)
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(result),
-            );
-            return Ok(());
-        }
-
-        if dialect::felt::is_felt_pow(op) {
-            let ops = operands(op)?;
-            let base = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt.pow base".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let exp = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing felt.pow exponent".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(base.pow(&exp)),
-            );
-            return Ok(());
-        }
-
-        if dialect::bool::is_bool_assert(op) {
-            let ops = operands(op)?;
-            let cond = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.assert operand".into()))?
-                .as_bool()
-                .map_err(Error::TypeError)?;
-            if !cond {
-                return Err(Error::ConstraintFailed("bool.assert failed".into()));
+                    .map_err(|_| Error::MalformedOp("shift amount too large".into()))?;
+                let result = match name {
+                    "felt.shl" => value.shl(amount_u32),
+                    "felt.shr" => value.shr(amount_u32),
+                    _ => unreachable!(),
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(result),
+                );
+                Ok(())
             }
-            return Ok(());
-        }
 
-        if dialect::scf_ext::is_scf_if(op) {
-            return self.eval_scf_if(op, frame);
-        }
-
-        if dialect::scf_ext::is_scf_while(op) {
-            return self.eval_scf_while(op, frame);
-        }
-
-        if op.name().as_string_ref().as_str() == Ok("bool.eq") {
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.eq lhs".into()))?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.eq rhs".into()))?;
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Bool(lhs == rhs),
-            );
-            return Ok(());
-        }
-
-        if dialect::bool::is_bool_cmp(op) {
-            let predicate = parse_cmp_predicate(op.attribute("predicate").map_err(Error::from)?)?;
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.cmp lhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.cmp rhs".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            let value = match predicate {
-                "eq" => lhs == rhs,
-                "ne" => lhs != rhs,
-                "lt" => lhs.as_biguint() < rhs.as_biguint(),
-                "le" => lhs.as_biguint() <= rhs.as_biguint(),
-                "gt" => lhs.as_biguint() > rhs.as_biguint(),
-                "ge" => lhs.as_biguint() >= rhs.as_biguint(),
-                _ => unreachable!(),
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Bool(value),
-            );
-            return Ok(());
-        }
-
-        if dialect::bool::is_bool_and(op) || dialect::bool::is_bool_or(op) {
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool lhs".into()))?
-                .as_bool()
-                .map_err(Error::TypeError)?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool rhs".into()))?
-                .as_bool()
-                .map_err(Error::TypeError)?;
-            let value = if dialect::bool::is_bool_and(op) {
-                lhs && rhs
-            } else {
-                lhs || rhs
-            };
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Bool(value),
-            );
-            return Ok(());
-        }
-
-        if dialect::bool::is_bool_not(op) {
-            let ops = operands(op)?;
-            let value = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing bool.not operand".into()))?
-                .as_bool()
-                .map_err(Error::TypeError)?;
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Bool(!value),
-            );
-            return Ok(());
-        }
-
-        if dialect::constrain::is_constrain_eq(op) {
-            let ops = operands(op)?;
-            let lhs = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing constrain.eq lhs".into()))?;
-            let rhs = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing constrain.eq rhs".into()))?;
-            self.state.record_constraint(lhs.clone(), rhs.clone());
-            if lhs != rhs {
-                return Err(Error::ConstraintFailed(format!("{lhs} != {rhs}")));
+            "felt.pow" => {
+                let ops = operands(op)?;
+                let base = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt.pow base".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let exp = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing felt.pow exponent".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(base.pow(&exp)),
+                );
+                Ok(())
             }
-            return Ok(());
-        }
 
-        if dialect::function::is_func_call(op) {
-            let symbol = call_target(op)?;
-            let operand_values = operands(op)?;
-            let args = operand_values
-                .iter()
-                .map(|operand| {
-                    frame.get(*operand).cloned().ok_or_else(|| {
-                        Error::MissingValue(format!("missing call operand {operand}"))
+            "bool.assert" => {
+                let ops = operands(op)?;
+                let cond = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.assert operand".into()))?
+                    .as_bool()
+                    .map_err(Error::TypeError)?;
+                if !cond {
+                    return Err(Error::ConstraintFailed("bool.assert failed".into()));
+                }
+                Ok(())
+            }
+
+            "scf.if" => self.eval_scf_if(op, frame),
+
+            "scf.while" => self.eval_scf_while(op, frame),
+
+            "bool.eq" => {
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.eq lhs".into()))?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.eq rhs".into()))?;
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Bool(lhs == rhs),
+                );
+                Ok(())
+            }
+
+            "bool.cmp" => {
+                let predicate =
+                    parse_cmp_predicate(op.attribute("predicate").map_err(Error::from)?)?;
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.cmp lhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.cmp rhs".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                let value = match predicate {
+                    "eq" => lhs == rhs,
+                    "ne" => lhs != rhs,
+                    "lt" => lhs.as_biguint() < rhs.as_biguint(),
+                    "le" => lhs.as_biguint() <= rhs.as_biguint(),
+                    "gt" => lhs.as_biguint() > rhs.as_biguint(),
+                    "ge" => lhs.as_biguint() >= rhs.as_biguint(),
+                    _ => unreachable!(),
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Bool(value),
+                );
+                Ok(())
+            }
+
+            "bool.and" | "bool.or" => {
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool lhs".into()))?
+                    .as_bool()
+                    .map_err(Error::TypeError)?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool rhs".into()))?
+                    .as_bool()
+                    .map_err(Error::TypeError)?;
+                let value = match name {
+                    "bool.and" => lhs && rhs,
+                    "bool.or" => lhs || rhs,
+                    _ => unreachable!(),
+                };
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Bool(value),
+                );
+                Ok(())
+            }
+
+            "bool.not" => {
+                let ops = operands(op)?;
+                let value = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing bool.not operand".into()))?
+                    .as_bool()
+                    .map_err(Error::TypeError)?;
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Bool(!value),
+                );
+                Ok(())
+            }
+
+            "constrain.eq" => {
+                let ops = operands(op)?;
+                let lhs = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing constrain.eq lhs".into()))?;
+                let rhs = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing constrain.eq rhs".into()))?;
+                self.state.record_constraint(lhs.clone(), rhs.clone());
+                if lhs != rhs {
+                    return Err(Error::ConstraintFailed(format!("{lhs} != {rhs}")));
+                }
+                Ok(())
+            }
+
+            "function.call" => {
+                let symbol = call_target(op)?;
+                self.state.stats.function_calls += 1;
+                *self
+                    .state
+                    .stats
+                    .callee_counts
+                    .entry(symbol.clone())
+                    .or_default() += 1;
+                let operand_values = operands(op)?;
+                let args = operand_values
+                    .iter()
+                    .map(|operand| {
+                        frame.get(*operand).cloned().ok_or_else(|| {
+                            Error::MissingValue(format!("missing call operand {operand}"))
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let arg_origins: Vec<Origin> = operand_values
-                .iter()
-                .map(|operand| frame.origin(*operand))
-                .collect();
-            let callee = find_function(self.module, &symbol)?;
-            // Functions marked `allow_witness` are treated by PCL as witness
-            // oracles, not as constraint-emitting bodies, so `bool.assert`
-            // inside them (the Brillig trap idiom) is legitimate even when
-            // reached from `@constrain`.
-            let callee_phase = if callee.has_allow_witness_attr() {
-                Phase::Compute
-            } else {
-                self.phase
-            };
-            let prev_phase = std::mem::replace(&mut self.phase, callee_phase);
-            let results = self.execute_function(&callee, &args, &arg_origins);
-            self.phase = prev_phase;
-            let results = results?;
-            for (index, value) in results.into_iter().enumerate() {
-                frame.insert(op.result(index).map_err(Error::from)?.into(), value);
+                    .collect::<Result<Vec<_>>>()?;
+                let arg_origins: Vec<Origin> = operand_values
+                    .iter()
+                    .map(|operand| frame.origin(*operand))
+                    .collect();
+                let callee = self.lookup_function(&symbol)?;
+                // Functions marked `allow_witness` are treated by PCL as witness
+                // oracles, not as constraint-emitting bodies, so `bool.assert`
+                // inside them (the Brillig trap idiom) is legitimate even when
+                // reached from `@constrain`.
+                let callee_phase = if callee.has_allow_witness_attr() {
+                    Phase::Compute
+                } else {
+                    self.phase
+                };
+                let prev_phase = std::mem::replace(&mut self.phase, callee_phase);
+                let results = self.execute_function(&callee, &args, &arg_origins);
+                self.phase = prev_phase;
+                let results = results?;
+                for (index, value) in results.into_iter().enumerate() {
+                    frame.insert(op.result(index).map_err(Error::from)?.into(), value);
+                }
+                Ok(())
             }
-            return Ok(());
-        }
 
-        if dialect::ram::is_ram_store(op) {
-            let ops = operands(op)?;
-            let addr = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing ram.store address".into()))?
-                .as_index()
-                .map_err(Error::TypeError)?;
-            let value = frame
-                .get(ops[1])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing ram.store value".into()))?
-                .as_felt()
-                .map_err(Error::TypeError)?;
-            self.state.ram_store(addr, value);
-            return Ok(());
-        }
+            "ram.store" => {
+                let ops = operands(op)?;
+                let addr = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing ram.store address".into()))?
+                    .as_index()
+                    .map_err(Error::TypeError)?;
+                let value = frame
+                    .get(ops[1])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing ram.store value".into()))?
+                    .as_felt()
+                    .map_err(Error::TypeError)?;
+                self.state.ram_store(addr, value);
+                Ok(())
+            }
 
-        if dialect::ram::is_ram_load(op) {
-            let ops = operands(op)?;
-            let addr = frame
-                .get(ops[0])
-                .cloned()
-                .ok_or_else(|| Error::MissingValue("missing ram.load address".into()))?
-                .as_index()
-                .map_err(Error::TypeError)?;
-            let value = self.state.ram_load(addr);
-            frame.insert(
-                op.result(0).map_err(Error::from)?.into(),
-                Value::Felt(value),
-            );
-            return Ok(());
-        }
+            "ram.load" => {
+                let ops = operands(op)?;
+                let addr = frame
+                    .get(ops[0])
+                    .cloned()
+                    .ok_or_else(|| Error::MissingValue("missing ram.load address".into()))?
+                    .as_index()
+                    .map_err(Error::TypeError)?;
+                let value = self.state.ram_load(addr);
+                frame.insert(
+                    op.result(0).map_err(Error::from)?.into(),
+                    Value::Felt(value),
+                );
+                Ok(())
+            }
 
-        let op_name = op
-            .name()
-            .as_string_ref()
-            .as_str()
-            .unwrap_or("<unknown-op>")
-            .to_string();
-        Err(Error::UnsupportedOp(op_name))
+            _ => Err(Error::UnsupportedOp(name.to_string())),
+        }
     }
 }
 
-/// Ops that produce values directly from their attributes (no SSA operands)
-/// and therefore always count as `Origin::Const` regardless of context.
 fn is_const_producing_op<'c, 'a>(op: &OperationRef<'c, 'a>) -> bool {
     if dialect::felt::is_felt_const(op) {
         return true;
@@ -1149,12 +1175,50 @@ fn is_const_producing_op<'c, 'a>(op: &OperationRef<'c, 'a>) -> bool {
     matches!(name_str, "arith.constant" | "index.constant")
 }
 
+/// Walks the module body once and indexes every `function.def` and
+/// `struct.def` (plus the nested `function.def`s inside each struct).
+/// This pays the expensive `StructDefOpRef::try_from` cost once instead of
+/// on every `function.call`.
+fn build_symbol_caches<'c, 'm>(
+    module: &'m Module<'c>,
+    stats: &mut Stats,
+) -> (
+    HashMap<String, FuncDefOpRef<'c, 'm>>,
+    HashMap<String, StructDefOpRef<'c, 'm>>,
+) {
+    let mut function_cache = HashMap::new();
+    let mut struct_cache = HashMap::new();
+
+    for op in iter_block_ops(module.body()) {
+        if let Ok(func) = FuncDefOpRef::try_from(op) {
+            stats.find_function_probes += 1;
+            function_cache.insert(fq_function_name(&func), func);
+            continue;
+        }
+        if let Ok(struct_def) = StructDefOpRef::try_from(op) {
+            struct_cache.insert(StructDefOpLike::name(&struct_def).to_string(), struct_def);
+            for inner in iter_block_ops(struct_def.body()) {
+                if let Ok(func) = FuncDefOpRef::try_from(inner) {
+                    stats.find_function_probes += 1;
+                    function_cache.insert(fq_function_name(&func), func);
+                }
+            }
+        }
+    }
+
+    (function_cache, struct_cache)
+}
+
 fn value_as_signed(value: &Value) -> Result<BigInt> {
     match value {
         Value::Index(v) => Ok(BigInt::from(*v)),
         Value::Int(v) => Ok(v.as_signed()),
         // i1 signed interpretation: true is -1, false is 0.
-        Value::Bool(b) => Ok(if *b { BigInt::from(-1i64) } else { BigInt::zero() }),
+        Value::Bool(b) => Ok(if *b {
+            BigInt::from(-1i64)
+        } else {
+            BigInt::zero()
+        }),
         other => Err(Error::TypeError(format!(
             "expected integer-like value, got {other}"
         ))),
@@ -1204,18 +1268,14 @@ fn arith_binary_index(suffix: &str, a: usize, b: usize) -> Result<usize> {
         "andi" => a & b,
         "ori" => a | b,
         "xori" => a ^ b,
-        "shli" => {
-            u32::try_from(b)
-                .ok()
-                .and_then(|amt| a.checked_shl(amt))
-                .unwrap_or(0)
-        }
-        "shrsi" | "shrui" => {
-            u32::try_from(b)
-                .ok()
-                .and_then(|amt| a.checked_shr(amt))
-                .unwrap_or(0)
-        }
+        "shli" => u32::try_from(b)
+            .ok()
+            .and_then(|amt| a.checked_shl(amt))
+            .unwrap_or(0),
+        "shrsi" | "shrui" => u32::try_from(b)
+            .ok()
+            .and_then(|amt| a.checked_shr(amt))
+            .unwrap_or(0),
         "maxsi" | "maxui" => a.max(b),
         "minsi" | "minui" => a.min(b),
         _ => {
@@ -1271,8 +1331,7 @@ fn arith_binary_int(suffix: &str, a: &IntValue, b: &IntValue) -> Result<IntValue
             let r = &av % &bv;
             // Round toward +inf.
             let adjusted = if !r.is_zero()
-                && ((av.sign() == num_bigint::Sign::Plus)
-                    == (bv.sign() == num_bigint::Sign::Plus))
+                && ((av.sign() == num_bigint::Sign::Plus) == (bv.sign() == num_bigint::Sign::Plus))
             {
                 q + BigInt::one()
             } else {
@@ -1355,8 +1414,14 @@ fn arith_binary_int(suffix: &str, a: &IntValue, b: &IntValue) -> Result<IntValue
                 Ok(IntValue::from_signed(q, width))
             }
         }
-        "maxsi" => Ok(IntValue::from_signed(a.as_signed().max(b.as_signed()), width)),
-        "minsi" => Ok(IntValue::from_signed(a.as_signed().min(b.as_signed()), width)),
+        "maxsi" => Ok(IntValue::from_signed(
+            a.as_signed().max(b.as_signed()),
+            width,
+        )),
+        "minsi" => Ok(IntValue::from_signed(
+            a.as_signed().min(b.as_signed()),
+            width,
+        )),
         "maxui" => Ok(IntValue::new(
             a.as_unsigned().max(b.as_unsigned()).clone(),
             width,

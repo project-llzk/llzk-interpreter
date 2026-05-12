@@ -1,7 +1,7 @@
 use llzk::prelude::{
     Attribute, AttributeLike, BlockLike, FlatSymbolRefAttribute, FuncDefOpLike, FuncDefOpRef,
-    IntegerAttribute, IntegerType, Module, OperationLike, OperationRef, StructDefOpLike,
-    StructDefOpRef, SymbolRefAttribute, Type, TypeLike, Value, ValueLike,
+    IntegerAttribute, IntegerType, OperationLike, OperationRef, SymbolRefAttribute, Type, TypeLike,
+    Value, ValueLike,
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
@@ -11,64 +11,26 @@ use crate::{
     value::{Felt, IntValue, Value as RuntimeValue},
 };
 
-/// Iterates over all operations in a block in order.
 pub fn iter_block_ops<'c, 'a>(
     block: llzk::prelude::BlockRef<'c, 'a>,
 ) -> impl Iterator<Item = OperationRef<'c, 'a>> {
     std::iter::successors(block.first_operation(), |op| op.next_in_block())
 }
 
-/// Returns all operands of an operation.
 pub fn operands<'c, 'a>(op: &OperationRef<'c, 'a>) -> Result<Vec<Value<'c, 'a>>> {
     (0..op.operand_count())
         .map(|i| op.operand(i).map_err(Into::into))
         .collect()
 }
 
-/// Returns the fully qualified function name.
 pub fn fq_function_name<'c, 'a>(func: &FuncDefOpRef<'c, 'a>) -> String {
     func.fully_qualified_name().to_string()
 }
 
-/// Returns the callee symbol string from a `function.call`.
 pub fn call_target<'c, 'a>(op: &OperationRef<'c, 'a>) -> Result<String> {
     Ok(SymbolRefAttribute::try_from(op.attribute("callee").map_err(Error::from)?)?.to_string())
 }
 
-/// Finds a struct definition by symbol name.
-pub fn find_struct<'c, 'a>(module: &'a Module<'c>, name: &str) -> Result<StructDefOpRef<'c, 'a>> {
-    for op in iter_block_ops(module.body()) {
-        if let Ok(struct_def) = StructDefOpRef::try_from(op)
-            && StructDefOpLike::name(&struct_def) == name
-        {
-            return Ok(struct_def);
-        }
-    }
-    Err(Error::SymbolNotFound(format!("struct @{name}")))
-}
-
-/// Finds a function definition by fully qualified symbol string.
-pub fn find_function<'c, 'a>(module: &'a Module<'c>, symbol: &str) -> Result<FuncDefOpRef<'c, 'a>> {
-    for op in iter_block_ops(module.body()) {
-        if let Ok(func) = FuncDefOpRef::try_from(op)
-            && fq_function_name(&func) == symbol
-        {
-            return Ok(func);
-        }
-        if let Ok(struct_def) = StructDefOpRef::try_from(op) {
-            for inner in iter_block_ops(struct_def.body()) {
-                if let Ok(func) = FuncDefOpRef::try_from(inner)
-                    && fq_function_name(&func) == symbol
-                {
-                    return Ok(func);
-                }
-            }
-        }
-    }
-    Err(Error::SymbolNotFound(format!("function {symbol}")))
-}
-
-/// Reads the member name attribute from `struct.readm` or `struct.writem`.
 pub fn member_name<'c, 'a>(op: &OperationRef<'c, 'a>) -> Result<String> {
     let attr = op.attribute("member_name").map_err(Error::from)?;
     Ok(FlatSymbolRefAttribute::try_from(attr)?.value().to_string())
@@ -157,7 +119,6 @@ pub fn parse_arith_const_value<'c, 'a>(
     )))
 }
 
-/// Predicates for `arith.cmpi`.
 #[derive(Clone, Copy, Debug)]
 pub enum CmpIPredicate {
     Eq,

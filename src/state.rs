@@ -4,14 +4,10 @@ use llzk::prelude::{Value as MlirValue, ValueLike};
 
 use crate::value::{Felt, Value};
 
-/// A concrete equality check observed during `constrain`.
 #[derive(Clone, Debug)]
 pub struct ConstraintRecord {
-    /// Left-hand side runtime value.
     pub lhs: Value,
-    /// Right-hand side runtime value.
     pub rhs: Value,
-    /// Whether the equality held concretely.
     pub satisfied: bool,
 }
 
@@ -38,7 +34,6 @@ pub enum Origin {
     Dynamic,
 }
 
-/// One function activation record.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     bindings: HashMap<usize, Value>,
@@ -46,13 +41,10 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Inserts a runtime value for an SSA value. The origin defaults to
-    /// `Dynamic`; callers may override with [`Frame::set_origin`].
     pub fn insert<'c, 'a>(&mut self, key: MlirValue<'c, 'a>, value: Value) {
         self.bindings.insert(value_key(key), value);
     }
 
-    /// Inserts a runtime value together with its provenance.
     pub fn insert_with_origin<'c, 'a>(
         &mut self,
         key: MlirValue<'c, 'a>,
@@ -64,18 +56,15 @@ impl Frame {
         self.origins.insert(k, origin);
     }
 
-    /// Retrieves a runtime value for an SSA value.
     pub fn get<'c, 'a>(&self, key: MlirValue<'c, 'a>) -> Option<&Value> {
         self.bindings.get(&value_key(key))
     }
 
-    /// Overrides the origin tag of an already-inserted value.
     pub fn set_origin<'c, 'a>(&mut self, key: MlirValue<'c, 'a>, origin: Origin) {
         self.origins.insert(value_key(key), origin);
     }
 
-    /// Returns the origin tag of an SSA value, defaulting to `Dynamic` for
-    /// values inserted without explicit provenance.
+    /// Defaults to `Dynamic` for values inserted without an explicit tag.
     pub fn origin<'c, 'a>(&self, key: MlirValue<'c, 'a>) -> Origin {
         self.origins
             .get(&value_key(key))
@@ -84,20 +73,59 @@ impl Frame {
     }
 }
 
-/// Global execution bookkeeping.
+/// Always-on counters; each costs a `u64` increment per event.
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub function_calls: u64,
+    /// Includes top-level entry points plus every `function.call` dispatch.
+    pub execute_function_invocations: u64,
+    pub op_dispatches: u64,
+    /// `function.def` ops indexed at construction. Coarse module-size signal.
+    pub find_function_probes: u64,
+    pub callee_counts: HashMap<String, u64>,
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "op dispatches:             {}", self.op_dispatches)?;
+        writeln!(
+            f,
+            "execute_function calls:    {}",
+            self.execute_function_invocations
+        )?;
+        writeln!(f, "function.call count:       {}", self.function_calls)?;
+        writeln!(
+            f,
+            "cached function defs:      {}",
+            self.find_function_probes
+        )?;
+        let ops_per_frame = if self.execute_function_invocations > 0 {
+            self.op_dispatches as f64 / self.execute_function_invocations as f64
+        } else {
+            0.0
+        };
+        writeln!(f, "avg ops per frame:         {ops_per_frame:.1}")?;
+        writeln!(f, "distinct callees:          {}", self.callee_counts.len())?;
+        let mut top: Vec<(&String, &u64)> = self.callee_counts.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        writeln!(f, "top callees:")?;
+        for (name, count) in top.iter().take(10) {
+            writeln!(f, "  {count:>8}  {name}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionState {
-    /// Active call stack, using the fully qualified function names.
     pub call_stack: Vec<String>,
-    /// Concrete constraints checked so far.
     pub constraints: Vec<ConstraintRecord>,
-    /// Flat felt memory region addressed by `ram.load` / `ram.store`.
     /// Unwritten cells read as zero.
     ram: HashMap<usize, Felt>,
+    pub stats: Stats,
 }
 
 impl ExecutionState {
-    /// Records a checked equality.
     pub fn record_constraint(&mut self, lhs: Value, rhs: Value) {
         let satisfied = lhs == rhs;
         self.constraints.push(ConstraintRecord {
@@ -116,7 +144,6 @@ impl ExecutionState {
     }
 }
 
-/// Computes a stable key for an SSA value.
 pub fn value_key<'c, 'a>(value: MlirValue<'c, 'a>) -> usize {
     value.to_raw().ptr as usize
 }

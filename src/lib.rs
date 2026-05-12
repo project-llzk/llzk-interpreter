@@ -6,31 +6,21 @@ mod state;
 mod value;
 
 pub use eval::Interpreter;
-pub use state::{ConstraintRecord, ExecutionState, Origin, Phase};
+pub use state::{ConstraintRecord, ExecutionState, Origin, Phase, Stats};
 pub use value::{ArrayInstance, Felt, IntValue, StructInstance, Value};
 
-/// Interpreter error.
 #[derive(Debug)]
 pub enum Error {
-    /// Underlying MLIR / LLZK API error.
     Llzk(String),
-    /// Unsupported operation.
     UnsupportedOp(String),
-    /// Malformed or unexpected IR shape.
     MalformedOp(String),
-    /// Missing symbol.
     SymbolNotFound(String),
-    /// Missing runtime value.
     MissingValue(String),
-    /// Type mismatch.
     TypeError(String),
-    /// Constraint failure.
     ConstraintFailed(String),
-    /// Parse failure.
     ParseError(String),
 }
 
-/// Convenience result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl std::fmt::Display for Error {
