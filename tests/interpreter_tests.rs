@@ -3,7 +3,7 @@ use llzk::prelude::{
     melior_dialects::arith,
 };
 use llzk::{
-    builder::OpBuilder,
+    builder::{BlockInsertPointLike, EntryPoint, OpBuilder},
     dialect::array::{ArrayCtor, ArrayType},
     prelude::{FeltConstAttribute, FeltType},
 };
@@ -401,7 +401,7 @@ module attributes {llzk.lang} {
 fn interprets_handwritten_cast_toindex_for_array_read() {
     let context = LlzkContext::new();
     let loc = Location::unknown(&context);
-    let module = llzk_module(loc);
+    let module = llzk_module(loc, Some("Noir"));
     let felt_type: Type<'_> = FeltType::new(&context).into();
     let index_type = Type::index(&context);
     let function = dialect::function::def(
@@ -414,7 +414,7 @@ fn interprets_handwritten_cast_toindex_for_array_read() {
     .expect("function should build");
     {
         let block = Block::new(&[(felt_type, loc)]);
-        let builder = OpBuilder::new(&context);
+        let builder = OpBuilder::new(&context, EntryPoint::End((&block).to_block_ref()));
         let idx: llzk::prelude::Value<'_, '_> = block.argument(0).expect("arg").into();
 
         let c0 = block.append_operation(arith::constant(

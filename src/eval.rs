@@ -75,7 +75,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     pub fn run_compute(&mut self, struct_name: &str, inputs: &[Value]) -> Result<StructInstance> {
         let struct_def = self.lookup_struct(struct_name)?;
         let compute = struct_def
-            .get_compute_func()
+            .compute_func()
             .ok_or_else(|| Error::SymbolNotFound(format!("compute for struct @{struct_name}")))?;
         let prev_phase = std::mem::replace(&mut self.phase, Phase::Compute);
         let origins = vec![Origin::Dynamic; inputs.len()];
@@ -98,7 +98,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     ) -> Result<()> {
         let struct_def = self.lookup_struct(struct_name)?;
         let constrain = struct_def
-            .get_constrain_func()
+            .constrain_func()
             .ok_or_else(|| Error::SymbolNotFound(format!("constrain for struct @{struct_name}")))?;
         let mut args = Vec::with_capacity(inputs.len() + 1);
         args.push(Value::Struct(Rc::new(RefCell::new(self_value))));
@@ -1196,7 +1196,7 @@ fn build_symbol_caches<'c, 'm>(
             continue;
         }
         if let Ok(struct_def) = StructDefOpRef::try_from(op) {
-            struct_cache.insert(StructDefOpLike::name(&struct_def).to_string(), struct_def);
+            struct_cache.insert(struct_def.sym_name().to_string(), struct_def);
             for inner in iter_block_ops(struct_def.body()) {
                 if let Ok(func) = FuncDefOpRef::try_from(inner) {
                     stats.find_function_probes += 1;
