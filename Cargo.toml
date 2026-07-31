@@ -8,8 +8,8 @@ name = "llzk-interpreter"
 path = "src/main.rs"
 
 [dependencies]
-llzk = { git = "https://github.com/Veridise/llzk-rs", features = ["bigint"], rev ="d354ea8" }
-llzk-sys = { git = "https://github.com/Veridise/llzk-rs", rev ="d354ea8" }
+llzk = { git = "https://github.com/Veridise/llzk-rs", features = ["bigint"] }
+llzk-sys = { git = "https://github.com/Veridise/llzk-rs" }
 melior = "0.25.1"
 num-bigint = "0.4"
 num-traits = "0.2"
