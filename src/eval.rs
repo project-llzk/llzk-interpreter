@@ -13,14 +13,14 @@ use num_traits::{One, Zero};
 use std::collections::{HashMap, VecDeque};
 
 use crate::{
-    Error, Result,
     dispatch::{
-        CmpIPredicate, call_target, fq_function_name, iter_block_ops, member_name, operands,
+        call_target, fq_function_name, iter_block_ops, member_name, operands,
         parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate, parse_felt_const,
-        result_struct_name,
+        result_struct_name, CmpIPredicate,
     },
     state::{ExecutionState, Frame, Origin, Phase, Stats},
     value::{ArrayInstance, Felt, IntValue, StructInstance, Value},
+    Error, Result,
 };
 
 /// Concrete interpreter for a small LLZK subset.
@@ -141,7 +141,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
 
         let result = (|| {
             for op in iter_block_ops(block) {
-                if dialect::function::is_func_return(&op) {
+                if dialect::function::is_return_op(&op) {
                     return self.eval_return(&op, &frame);
                 }
                 self.eval_op(&op, &mut frame)?;
@@ -182,7 +182,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             .ok_or_else(|| Error::MalformedOp("scf.if region without block".into()))?;
 
         for inner_op in iter_block_ops(block) {
-            if dialect::scf_ext::is_scf_yield(&inner_op) {
+            if dialect::scf_ext::is_yield_op(&inner_op) {
                 let yield_operands = operands(&inner_op)?;
                 for (index, yield_val) in yield_operands.into_iter().enumerate() {
                     let value = frame.get(yield_val).cloned().ok_or_else(|| {
@@ -229,7 +229,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
             let mut forwarded: Vec<Value> = Vec::new();
             let mut saw_condition = false;
             for inner_op in iter_block_ops(before_block) {
-                if dialect::scf_ext::is_scf_condition(&inner_op) {
+                if dialect::scf_ext::is_condition_op(&inner_op) {
                     let cond_ops = operands(&inner_op)?;
                     let (cond_operand, value_operands) =
                         cond_ops.split_first().ok_or_else(|| {
@@ -276,7 +276,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
 
             let mut next: Option<Vec<Value>> = None;
             for inner_op in iter_block_ops(after_block) {
-                if dialect::scf_ext::is_scf_yield(&inner_op) {
+                if dialect::scf_ext::is_yield_op(&inner_op) {
                     let yielded = operands(&inner_op)?
                         .into_iter()
                         .map(|v| {
@@ -580,7 +580,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     /// constraint when its condition folds to a static constant. A dynamic
     /// condition silently disappears at proof time, which is a soundness gap.
     fn check_bool_assert_origin(&self, op: &OperationRef<'c, '_>, frame: &Frame) -> Result<()> {
-        if self.phase != Phase::Constrain || !dialect::bool::is_bool_assert(op) {
+        if self.phase != Phase::Constrain || !dialect::bool::is_assert_op(op) {
             return Ok(());
         }
         let ops = operands(op)?;
@@ -601,7 +601,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
     /// `Const` and the op itself isn't an intrinsic source of dynamic data
     /// (`llzk.nondet`); known constant-producing ops are forced to `Const`.
     fn propagate_result_origins(&self, op: &OperationRef<'c, '_>, frame: &mut Frame) {
-        let origin = if dialect::llzk::is_nondet(op) {
+        let origin = if dialect::llzk::is_nondet_op(op) {
             Origin::Dynamic
         } else if is_const_producing_op(op) {
             Origin::Const
@@ -1164,7 +1164,7 @@ impl<'c, 'm> Interpreter<'c, 'm> {
 }
 
 fn is_const_producing_op<'c, 'a>(op: &OperationRef<'c, 'a>) -> bool {
-    if dialect::felt::is_felt_const(op) {
+    if dialect::felt::is_const_op(op) {
         return true;
     }
     let name = op.name();
