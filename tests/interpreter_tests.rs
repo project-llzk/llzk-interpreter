@@ -1,10 +1,11 @@
 use llzk::prelude::{
-    Block, BlockLike, LlzkContext, Module, OperationLike, RegionLike, Type, dialect, llzk_module,
+    BlockLike, LlzkContext, Module, OperationLike, RegionLike, Type, dialect,
     melior_dialects::arith,
 };
 use llzk::{
-    builder::{BlockInsertPointLike, EntryPoint, OpBuilder},
+    builder::{EntryPoint, OpBuilder},
     dialect::array::{ArrayCtor, ArrayType},
+    dialect::module::LlzkModuleBuilder,
     prelude::{FeltConstAttribute, FeltType},
 };
 use llzk_interpreter::{Felt, Interpreter, StructInstance, Value};
@@ -401,20 +402,27 @@ module attributes {llzk.lang} {
 fn interprets_handwritten_cast_toindex_for_array_read() {
     let context = LlzkContext::new();
     let loc = Location::unknown(&context);
-    let module = llzk_module(loc, Some("Noir"));
+    let module = LlzkModuleBuilder::create(loc, Some("Noir"));
+    let builder = OpBuilder::new(&context, EntryPoint::End(module.body()));
     let felt_type: Type<'_> = FeltType::new(&context).into();
     let index_type = Type::index(&context);
     let function = dialect::function::def(
+        &builder,
         loc,
         "lookup",
         FunctionType::new(&context, &[felt_type], &[felt_type]),
         &[],
         None,
+        llzk::dialect::empty_region,
     )
     .expect("function should build");
     {
-        let block = Block::new(&[(felt_type, loc)]);
-        let builder = OpBuilder::new(&context, EntryPoint::End((&block).to_block_ref()));
+        let block = function
+            .region(0)
+            .expect("function region")
+            .first_block()
+            .expect("entry block");
+        let builder = OpBuilder::new(&context, EntryPoint::End(block));
         let idx: llzk::prelude::Value<'_, '_> = block.argument(0).expect("arg").into();
 
         let c0 = block.append_operation(arith::constant(
@@ -433,60 +441,54 @@ fn interprets_handwritten_cast_toindex_for_array_read() {
             loc,
         ));
 
-        let a = block.append_operation(
-            dialect::felt::constant(loc, FeltConstAttribute::new(&context, 10, None))
-                .expect("felt const"),
-        );
-        let b = block.append_operation(
-            dialect::felt::constant(loc, FeltConstAttribute::new(&context, 20, None))
-                .expect("felt const"),
-        );
-        let c = block.append_operation(
-            dialect::felt::constant(loc, FeltConstAttribute::new(&context, 30, None))
-                .expect("felt const"),
-        );
+        let a = dialect::felt::constant(&builder, loc, FeltConstAttribute::new(&context, 10, None))
+            .expect("felt const");
+        let b = dialect::felt::constant(&builder, loc, FeltConstAttribute::new(&context, 20, None))
+            .expect("felt const");
+        let c = dialect::felt::constant(&builder, loc, FeltConstAttribute::new(&context, 30, None))
+            .expect("felt const");
 
-        let array = block.append_operation(dialect::array::new(
+        let array = dialect::array::new(
             &builder,
             loc,
             ArrayType::new_with_dims(felt_type, &[3]),
             ArrayCtor::Empty,
-        ));
-        block.append_operation(dialect::array::write(
+        );
+        dialect::array::write(
+            &builder,
             loc,
             array.result(0).expect("array result").into(),
             &[c0.result(0).expect("c0 result").into()],
             a.result(0).expect("a result").into(),
-        ));
-        block.append_operation(dialect::array::write(
+        );
+        dialect::array::write(
+            &builder,
             loc,
             array.result(0).expect("array result").into(),
             &[c1.result(0).expect("c1 result").into()],
             b.result(0).expect("b result").into(),
-        ));
-        block.append_operation(dialect::array::write(
+        );
+        dialect::array::write(
+            &builder,
             loc,
             array.result(0).expect("array result").into(),
             &[c2.result(0).expect("c2 result").into()],
             c.result(0).expect("c result").into(),
-        ));
-        let cast = block.append_operation(dialect::cast::toindex(loc, idx));
-        let result = block.append_operation(dialect::array::read(
+        );
+        let cast = dialect::cast::toindex(&builder, loc, idx, None);
+        let result = dialect::array::read(
+            &builder,
             loc,
             felt_type,
             array.result(0).expect("array result").into(),
             &[cast.result(0).expect("cast result").into()],
-        ));
-        block.append_operation(dialect::function::r#return(
+        );
+        dialect::function::r#return(
+            &builder,
             loc,
             &[result.result(0).expect("read result").into()],
-        ));
-        function
-            .region(0)
-            .expect("function region")
-            .append_block(block);
+        );
     }
-    module.body().append_operation(function.into());
 
     let mut interpreter = Interpreter::new(&module);
     let result = interpreter
