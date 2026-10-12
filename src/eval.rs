@@ -13,14 +13,14 @@ use num_traits::{One, Zero};
 use std::collections::{HashMap, VecDeque};
 
 use crate::{
+    Error, Result,
     dispatch::{
-        call_target, fq_function_name, iter_block_ops, member_name, operands,
+        CmpIPredicate, call_target, fq_function_name, iter_block_ops, member_name, operands,
         parse_arith_const_value, parse_cmp_predicate, parse_cmpi_predicate, parse_felt_const,
-        result_struct_name, CmpIPredicate,
+        result_struct_name,
     },
     state::{ExecutionState, Frame, Origin, Phase, Stats},
     value::{ArrayInstance, Felt, IntValue, StructInstance, Value},
-    Error, Result,
 };
 
 /// Concrete interpreter for a small LLZK subset.

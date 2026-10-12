@@ -3,7 +3,10 @@
 # will have compiled files and executables
 debug/
 target/
-Cargo.lock
+
+### Nix ###
+/result
+/result-*
 
 ### OS generated ###
 .DS_Store
