@@ -4,6 +4,10 @@
 debug/
 target/
 
+### Nix ###
+/result
+/result-*
+
 ### OS generated ###
 .DS_Store
 
