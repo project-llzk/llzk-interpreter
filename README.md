@@ -72,8 +72,56 @@ make lint
 make fmt
 ```
 
-On macOS, the local `scripts/build-macos.sh` helper sets the LLVM / SDK /
-Homebrew-related environment expected by the Rust LLZK bindings.
+### Nix
+
+The flake provides a compatible Rust, LLZK, and LLVM/MLIR toolchain:
+
+```sh
+nix build                            # binary: result/bin/llzk-interpreter
+nix develop --command cargo build    # build in the development environment
+nix develop --command cargo test     # run the test suite
+```
+
+Run `nix develop` for an interactive shell, then use Cargo or the Make
+targets above. `nix build` also runs the test suite.
+Keep the `llzk-rs` revisions in `Cargo.lock` and `flake.lock` aligned when
+updating dependencies (`nix flake update llzk-rs` updates the Nix input).
+
+### Manual build
+
+Follow the [llzk-rs manual installation instructions](https://github.com/project-llzk/llzk-rs#manual-installation)
+to install LLVM/MLIR, build and install LLZK, and configure the build environment.
+Use versions compatible with the `llzk-rs` revision in this repository's
+`Cargo.lock`, and use the same LLVM/MLIR build for LLZK and the Rust bindings.
+The dependencies are already declared in `Cargo.toml`; Cargo builds the bindings
+as part of building the interpreter.
+
+Keep the upstream environment variables set (`MLIR_SYS_230_PREFIX`,
+`TABLEGEN_230_PREFIX`, `LLZK_SYS_30_PREFIX`, and any platform-specific settings),
+then run these commands from this repository's root:
+
+```sh
+make build
+make test
+```
+
+On macOS, these targets use `scripts/build-macos.sh` to check LLVM/LLZK
+compatibility and configure library search paths. You can also invoke it
+directly with Cargo arguments:
+
+```sh
+./scripts/build-macos.sh                  # cargo build
+./scripts/build-macos.sh build --release  # release build
+./scripts/build-macos.sh test             # run tests
+```
+
+### Troubleshooting
+
+- **Undefined LLVM/MLIR symbols:** check for mixed toolchains. LLZK's
+  `CMakeCache.txt` records `LLVM_DIR` and `MLIR_DIR`; its installed
+  `lib/cmake/LLZK/LLZKTargets.cmake` also records the header paths.
+- **Switched native installations:** run
+  `cargo clean -p llzk-sys -p mlir-sys -p tblgen` before rebuilding.
 
 ## Scope
 

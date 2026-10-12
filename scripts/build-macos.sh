@@ -3,71 +3,78 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
+# The crate-specific prefix also wins over an inherited generic LLVM_PREFIX
+# when entering a Nix shell from a manually configured environment.
+LLVM_PREFIX="${MLIR_SYS_230_PREFIX:-${LLVM_PREFIX:-}}"
 
-# Homebrew LLVM default locations (Apple Silicon first, then Intel).
 if [[ -z "${LLVM_PREFIX:-}" ]]; then
-  if [[ -d "/opt/homebrew/opt/llvm@20" ]]; then
-    LLVM_PREFIX="/opt/homebrew/opt/llvm@20"
-  elif [[ -d "/usr/local/opt/llvm@20" ]]; then
-    LLVM_PREFIX="/usr/local/opt/llvm@20"
-  else
-    echo "error: llvm@20 not found. Set LLVM_PREFIX manually." >&2
-    exit 1
-  fi
-fi
-
-if [[ -z "${LLZK_PCL_ROOT:-}" ]]; then
-  default_pcl_root="${repo_root}/../pcl-mlir"
-  if [[ -d "${default_pcl_root}" ]]; then
-    LLZK_PCL_ROOT="${default_pcl_root}"
-  else
-    echo "error: LLZK_PCL_ROOT is not set and ${default_pcl_root} does not exist." >&2
-    echo "set LLZK_PCL_ROOT to your local pcl-mlir checkout." >&2
-    exit 1
-  fi
-fi
-
-if [[ -z "${LLZK_PCL_PREFIX:-}" ]]; then
-  LLZK_PCL_PREFIX="${LLZK_PCL_ROOT}/build"
-fi
-
-if [[ ! -d "${LLZK_PCL_PREFIX}" ]]; then
-  echo "error: LLZK_PCL_PREFIX does not exist: ${LLZK_PCL_PREFIX}" >&2
-  echo "build pcl-mlir first or set LLZK_PCL_PREFIX to the correct build directory." >&2
+  echo "error: set LLVM_PREFIX or MLIR_SYS_230_PREFIX to the LLVM/MLIR installation used to build LLZK." >&2
+  echo "alternatively, run this command inside 'nix develop'." >&2
   exit 1
 fi
 
-if [[ -z "${LLZK_LIB_ROOT:-}" ]]; then
-  default_llzk_root="${repo_root}/../llzk-lib"
-  if [[ -d "${default_llzk_root}" ]]; then
-    LLZK_LIB_ROOT="${default_llzk_root}"
+export MLIR_SYS_230_PREFIX="${MLIR_SYS_230_PREFIX:-${LLVM_PREFIX}}"
+export TABLEGEN_230_PREFIX="${TABLEGEN_230_PREFIX:-${LLVM_PREFIX}}"
+for prefix in "${MLIR_SYS_230_PREFIX}" "${TABLEGEN_230_PREFIX}"; do
+  if [[ ! -x "${prefix}/bin/llvm-config" ]] || \
+     [[ "$("${prefix}/bin/llvm-config" --version)" != 23.* ]]; then
+    echo "error: ${prefix}/bin/llvm-config must report LLVM 23.x." >&2
+    exit 1
   fi
-fi
-
-export MLIR_SYS_200_PREFIX="${MLIR_SYS_200_PREFIX:-${LLVM_PREFIX}}"
-export TABLEGEN_200_PREFIX="${TABLEGEN_200_PREFIX:-${LLVM_PREFIX}}"
+done
 export LIBCLANG_PATH="${LIBCLANG_PATH:-${LLVM_PREFIX}/lib}"
-export LLZK_PCL_ROOT
-export LLZK_PCL_PREFIX
-if [[ -n "${LLZK_LIB_ROOT:-}" ]]; then
-  export LLZK_SYS_10_PREFIX="${LLZK_SYS_10_PREFIX:-${LLZK_LIB_ROOT}/build/install}"
+export LLZK_SYS_30_PREFIX="${LLZK_SYS_30_PREFIX:-${LLZK_LIB_ROOT:-${repo_root}/../llzk-lib}/build/install}"
+if [[ ! -d "${LLZK_SYS_30_PREFIX}/include/llzk" || \
+      ! -f "${LLZK_SYS_30_PREFIX}/lib/libLLZKCAPI.a" ]]; then
+  echo "error: LLZK 3 installation not found at ${LLZK_SYS_30_PREFIX}." >&2
+  echo "set LLZK_SYS_30_PREFIX to LLZK's install directory (built with LLVM 23)." >&2
+  exit 1
 fi
-export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 
-# Keep any existing RUSTFLAGS while guaranteeing Homebrew lib lookup for zstd.
-if [[ "${RUSTFLAGS:-}" == *"-L /opt/homebrew/lib/"* || "${RUSTFLAGS:-}" == *"-L/opt/homebrew/lib/"* ]]; then
-  export RUSTFLAGS
-else
-  export RUSTFLAGS="${RUSTFLAGS:-} -L /opt/homebrew/lib/"
+# Installed LLZK exports the LLVM headers it was built with. Check the build
+# configuration, since matching LLVM version numbers alone do not imply ABI
+# compatibility (notably for Nix debug versus Homebrew release builds).
+llzk_targets="${LLZK_SYS_30_PREFIX}/lib/cmake/LLZK/LLZKTargets.cmake"
+if [[ -f "${llzk_targets}" ]]; then
+  llzk_llvm_include="$(awk '
+    /^set_target_properties\(LLZK::LLVMHeaders PROPERTIES/ { in_target = 1 }
+    in_target && /INTERFACE_INCLUDE_DIRECTORIES/ { split($0, parts, "\""); print parts[2]; exit }
+  ' "${llzk_targets}")"
+  for prefix in "${MLIR_SYS_230_PREFIX}" "${TABLEGEN_230_PREFIX}"; do
+    llvm_include="$("${prefix}/bin/llvm-config" --includedir)"
+    for config in abi-breaking.h llvm-config.h; do
+      if [[ -f "${llzk_llvm_include}/llvm/Config/${config}" ]] && \
+         ! cmp -s "${llzk_llvm_include}/llvm/Config/${config}" "${llvm_include}/llvm/Config/${config}"; then
+        echo "error: LLZK and ${prefix} use different LLVM build configurations (${config})." >&2
+        echo "LLZK was built with headers at ${llzk_llvm_include}." >&2
+        echo "use that LLVM/MLIR build, or rebuild LLZK against ${prefix}." >&2
+        exit 1
+      fi
+    done
+  done
+fi
+# Let the compiler select its matching SDK unless the caller overrides it.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$(sw_vers -productVersion)}"
+
+# Homebrew's LLVM uses system libraries such as zstd from its own prefix.
+# Preserve a Nix/custom toolchain's flags without adding Homebrew libraries.
+case "${LLVM_PREFIX}" in
+  /opt/homebrew/*) brew_lib=/opt/homebrew/lib ;;
+  /usr/local/*) brew_lib=/usr/local/lib ;;
+  *) brew_lib= ;;
+esac
+if [[ -n "${brew_lib}" && "${RUSTFLAGS:-}" != *"-L ${brew_lib}"* && \
+      "${RUSTFLAGS:-}" != *"-L${brew_lib}"* ]]; then
+  export RUSTFLAGS="${RUSTFLAGS:-} -L ${brew_lib}"
 fi
 
 echo "Building with:"
-echo "  MLIR_SYS_200_PREFIX=${MLIR_SYS_200_PREFIX}"
-echo "  TABLEGEN_200_PREFIX=${TABLEGEN_200_PREFIX}"
+echo "  MLIR_SYS_230_PREFIX=${MLIR_SYS_230_PREFIX}"
+echo "  TABLEGEN_230_PREFIX=${TABLEGEN_230_PREFIX}"
 echo "  LIBCLANG_PATH=${LIBCLANG_PATH}"
-echo "  LLZK_PCL_ROOT=${LLZK_PCL_ROOT}"
-echo "  LLZK_PCL_PREFIX=${LLZK_PCL_PREFIX}"
-echo "  SDKROOT=${SDKROOT}"
+echo "  LLZK_SYS_30_PREFIX=${LLZK_SYS_30_PREFIX}"
+echo "  SDKROOT=${SDKROOT:-<compiler default>}"
+echo "  MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
 
 cd "${repo_root}"
 if [[ "$#" -eq 0 ]]; then
